@@ -4,9 +4,11 @@
 
 pub mod config;
 pub mod crypto;
+pub mod link;
 pub mod storage;
 
 pub use config::Config;
+pub use link::{LinkError, LinkOutcome, finalize_link, mark_linked, persist_provision_message, prepare_link_session};
 pub use storage::{Identity, LinkStatus, SqliteStore, Store, StoreError};
 
 use colored::*;
