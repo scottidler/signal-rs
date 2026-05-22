@@ -3,6 +3,7 @@
 #![deny(unused_variables)]
 
 pub mod config;
+pub mod crypto;
 pub mod storage;
 
 pub use config::Config;

@@ -42,6 +42,7 @@ cbc = "0.2.1"
 subtle = "2.6.1"
 zeroize = "1.8.2"
 async-trait = "0.1.89"
+rand = { version = "0.9.4", features = ["std"] }
 
 [dev-dependencies]
 # Pin to match libsignal's workspace ("rand = 0.9.4, rand_chacha = 0.9");
@@ -54,6 +55,7 @@ tempfile = "3"
 tokio = { version = "1.52.3", features = ["test-util", "macros"] }
 
 [build-dependencies]
+prost-build = "0.14.3"
 # For build.rs if needed
 
 # libsignal's workspace patches curve25519-dalek to Signal's fork; consuming it

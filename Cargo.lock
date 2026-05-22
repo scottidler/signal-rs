@@ -3562,6 +3562,7 @@ dependencies = [
  "libsignal-protocol",
  "log",
  "prost",
+ "prost-build",
  "qrcode",
  "rand 0.9.4",
  "rand_chacha",
