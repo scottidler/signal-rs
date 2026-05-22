@@ -3546,6 +3546,7 @@ name = "signal-rs"
 version = "0.1.0"
 dependencies = [
  "aes 0.9.0",
+ "async-trait",
  "bytes",
  "cbc 0.2.1",
  "clap",
@@ -3562,6 +3563,8 @@ dependencies = [
  "log",
  "prost",
  "qrcode",
+ "rand 0.9.4",
+ "rand_chacha",
  "serde",
  "serde_yaml",
  "sha2 0.11.0",

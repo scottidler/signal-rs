@@ -3,8 +3,10 @@
 #![deny(unused_variables)]
 
 pub mod config;
+pub mod storage;
 
 pub use config::Config;
+pub use storage::{Identity, LinkStatus, SqliteStore, Store, StoreError};
 
 use colored::*;
 use eyre::Result;
