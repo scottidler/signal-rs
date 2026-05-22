@@ -19,9 +19,42 @@ serde_yaml = "*"
 dirs = "*"
 colored = "*"
 
+# libsignal v0.94.1 - three sibling crates from one workspace, one source.
+# Cargo has no syntax for "share git/tag across multiple crate names", so the
+# URL+tag repeats. libsignal-core comes transitively through libsignal-protocol;
+# libsignal-net is direct because libsignal-net-chat does NOT re-export
+# ProvisioningEvent (it lives in libsignal_net::chat::server_requests).
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.94.1" }
+libsignal-net      = { git = "https://github.com/signalapp/libsignal", tag = "v0.94.1" }
+libsignal-net-chat = { git = "https://github.com/signalapp/libsignal", tag = "v0.94.1" }
+tokio = { version = "1.52.3", features = ["full"] }
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "migrate"] }
+prost = "0.14.3"
+qrcode = "0.14.1"
+thiserror = "2.0.18"
+futures = "0.3.32"
+bytes = "1.11.1"
+hkdf = "0.13.0"
+hmac = "0.13.0"
+sha2 = "0.11.0"
+aes = "0.9.0"
+cbc = "0.2.1"
+subtle = "2.6.1"
+zeroize = "1.8.2"
+
 [dev-dependencies]
 # tempfile is used by the generated config/tests.rs and lib tests
 tempfile = "3"
 
 [build-dependencies]
 # For build.rs if needed
+
+# libsignal's workspace patches curve25519-dalek to Signal's fork; consuming it
+# as a git dep doesn't carry that patch over, so we replicate it here. Without
+# this block we get two versions of curve25519-dalek (upstream pulled by
+# ed25519-dalek, Signal's fork pulled by zkgroup), which makes zkgroup fail.
+# boring is patched for the same reason - libsignal-net pulls it in for TLS.
+[patch.crates-io]
+boring     = { git = "https://github.com/signalapp/boring", tag = "signal-v5.0.2" }
+boring-sys = { git = "https://github.com/signalapp/boring", tag = "signal-v5.0.2" }
+curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }
