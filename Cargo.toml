@@ -1,0 +1,27 @@
+[package]
+name = "signal-rs"
+version = "0.1.0"
+edition = "2024"
+authors = ["Scott Idler <scott.idler@gmail.com>"]
+build = "build.rs"
+description = "Native-Rust Signal client - library + CLI; v0.1 unblocks borg Note-to-Self ingest"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/scottidler/signal-rs"
+readme = "README.md"
+
+[dependencies]
+clap = { version = "*", features = ["derive"] }
+eyre = "*"
+log = "*"
+env_logger = "*"
+serde = { version = "*", features = ["derive"] }
+serde_yaml = "*"
+dirs = "*"
+colored = "*"
+
+[dev-dependencies]
+# tempfile is used by the generated config/tests.rs and lib tests
+tempfile = "3"
+
+[build-dependencies]
+# For build.rs if needed
