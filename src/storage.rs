@@ -7,8 +7,10 @@
 //! libsignal-protocol session cipher can drive it directly.
 
 pub mod sqlite;
+pub mod tx;
 
 pub use sqlite::SqliteStore;
+pub use tx::TxStore;
 
 use libsignal_protocol::IdentityKeyPair;
 use thiserror::Error;
