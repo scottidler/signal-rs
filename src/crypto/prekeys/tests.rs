@@ -34,16 +34,39 @@ async fn linked_store() -> SqliteStore {
 }
 
 #[tokio::test]
-async fn generate_and_persist_batch_writes_all_records() {
+async fn generate_batch_produces_records_in_memory_only() {
     let store = linked_store().await;
     let mut rng = ChaCha20Rng::seed_from_u64(7);
-    let batch = generate_and_persist_batch(&mut rng, &store, 1).await.unwrap();
+    let batch = generate_batch(&mut rng, &store, 1).await.unwrap();
+
     assert_eq!(batch.one_time_prekey_ids.len(), PREKEY_BATCH_SIZE as usize);
     assert_eq!(batch.one_time_prekey_ids[0], 1);
     assert_eq!(batch.signed_prekey_id, 1 + PREKEY_BATCH_SIZE);
     assert_eq!(batch.kyber_prekey_id, 1 + PREKEY_BATCH_SIZE + 1);
+    assert_eq!(batch.one_time_records.len(), PREKEY_BATCH_SIZE as usize);
 
-    // Spot-check: the first one-time prekey is fetchable from the store.
+    // signal-cli's ordering: generate produces in-memory records ONLY,
+    // does NOT touch the local store. The store must not yet have the
+    // prekey we just generated.
+    let first_id = PreKeyId::from(batch.one_time_prekey_ids[0]);
+    let s = store.clone();
+    assert!(
+        PreKeyStore::get_pre_key(&s, first_id).await.is_err(),
+        "generate_batch must not write to the store - persist_batch does that after upload"
+    );
+}
+
+#[tokio::test]
+async fn persist_batch_writes_after_upload_success() {
+    // The signal-cli order: generate -> upload -> persist. We can't
+    // run upload in tests (no live server), so simulate the success
+    // path by calling persist_batch directly. After persist, the
+    // records are visible via PreKeyStore::get_pre_key.
+    let store = linked_store().await;
+    let mut rng = ChaCha20Rng::seed_from_u64(11);
+    let batch = generate_batch(&mut rng, &store, 1).await.unwrap();
+    persist_batch(&store, &batch).await.unwrap();
+
     let first_id = PreKeyId::from(batch.one_time_prekey_ids[0]);
     let s = store.clone();
     let record = PreKeyStore::get_pre_key(&s, first_id).await.unwrap();
@@ -54,9 +77,9 @@ async fn generate_and_persist_batch_writes_all_records() {
 async fn second_batch_uses_disjoint_ids() {
     let store = linked_store().await;
     let mut rng = ChaCha20Rng::seed_from_u64(8);
-    let first = generate_and_persist_batch(&mut rng, &store, 1).await.unwrap();
+    let first = generate_batch(&mut rng, &store, 1).await.unwrap();
     let next_start = first.kyber_prekey_id + 1;
-    let second = generate_and_persist_batch(&mut rng, &store, next_start).await.unwrap();
+    let second = generate_batch(&mut rng, &store, next_start).await.unwrap();
 
     let first_set: std::collections::HashSet<u32> = first.one_time_prekey_ids.iter().copied().collect();
     let second_set: std::collections::HashSet<u32> = second.one_time_prekey_ids.iter().copied().collect();
@@ -66,13 +89,14 @@ async fn second_batch_uses_disjoint_ids() {
 }
 
 #[tokio::test]
-async fn upload_batch_against_missing_credentials_errors_cleanly() {
-    // A bare in-memory store has no password/aci persisted; upload_batch
-    // must surface a clean MissingCredential-style error rather than panic
-    // or attempt the live request.
+async fn upload_batch_against_missing_credentials_errors_without_polluting_store() {
+    // signal-cli's ordering: a failed upload must NOT leave orphan
+    // prekeys in the local store. Generate, attempt upload (fails
+    // because no aci/password in the in-memory store), confirm that
+    // no prekey row was written.
     let store = linked_store().await;
     let mut rng = ChaCha20Rng::seed_from_u64(9);
-    let batch = generate_and_persist_batch(&mut rng, &store, 1).await.unwrap();
+    let batch = generate_batch(&mut rng, &store, 1).await.unwrap();
     match upload_batch(&store, &batch).await {
         Err(PrekeyError::Upload(msg)) => assert!(
             msg.contains("aci") || msg.contains("password") || msg.contains("missing"),
@@ -80,4 +104,12 @@ async fn upload_batch_against_missing_credentials_errors_cleanly() {
         ),
         other => panic!("expected Upload(missing-credential) error, got {:?}", other),
     }
+    // The store must still NOT have the prekey - upload failed, no
+    // persist should have occurred.
+    let first_id = PreKeyId::from(batch.one_time_prekey_ids[0]);
+    let s = store.clone();
+    assert!(
+        PreKeyStore::get_pre_key(&s, first_id).await.is_err(),
+        "failed upload must not leave orphan prekey in the local store"
+    );
 }

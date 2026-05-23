@@ -27,7 +27,7 @@ use log::{debug, info};
 use thiserror::Error;
 use tokio::time::timeout;
 
-use crate::crypto::prekeys::{PrekeyError, generate_and_persist_batch, upload_batch};
+use crate::crypto::prekeys::{PrekeyError, generate_upload_persist, upload_batch};
 use crate::crypto::provisioning::{ProvisioningKeyPair, decrypt_envelope, proto::ProvisionMessage};
 use crate::net::{Environment as NetEnv, NetError, connect_provisioning};
 use crate::storage::{LinkStatus, SqliteStore, Store, StoreError};
@@ -367,7 +367,7 @@ async fn finish_prekey_upload(store: &SqliteStore, account_number: &str) -> Resu
     let mut rng = rand::rng();
     // Initial upload starts at prekey id 1. Phase 8 replenishment will
     // continue from the highest id already in the store.
-    let batch = generate_and_persist_batch(&mut rng, store, 1).await?;
+    let batch = generate_upload_persist(&mut rng, store, 1).await?;
     upload_batch(store, &batch).await?;
     mark_linked(store).await?;
     info!("finish_prekey_upload: link_status -> Linked");

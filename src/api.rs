@@ -362,7 +362,7 @@ mod tests {
         // (b64 padding, libsignal serialize() format changes) that the
         // synthetic test below cannot see.
         use crate::SqliteStore;
-        use crate::crypto::prekeys::generate_and_persist_batch;
+        use crate::crypto::prekeys::generate_batch;
         use libsignal_protocol::IdentityKeyPair;
         use rand::SeedableRng;
         use rand_chacha::ChaCha20Rng;
@@ -374,7 +374,12 @@ mod tests {
             .save_identity_bundle(&identity, 12345, "+15555550100", 1, crate::storage::LinkStatus::Linked)
             .await
             .unwrap();
-        let batch = generate_and_persist_batch(&mut rng, &store, 1).await.unwrap();
+        // generate_batch produces records in memory but the test path
+        // reads them back from the store via the upload-body builder.
+        // Persist directly for the test (skipping the upload that we
+        // can't run without a live server).
+        let batch = generate_batch(&mut rng, &store, 1).await.unwrap();
+        crate::crypto::prekeys::persist_batch(&store, &batch).await.unwrap();
         let body = build_prekey_upload_body(&store, &identity, &batch).await.unwrap();
 
         let json: serde_json::Value = serde_json::to_value(&body).unwrap();

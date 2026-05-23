@@ -850,7 +850,7 @@ impl Client {
     /// had, which is a good time to ensure the next inbound peer has
     /// keys to start a session.
     async fn maybe_replenish_prekeys(&self) -> Result<(), ReceiveError> {
-        use crate::crypto::prekeys::{PREKEY_LOW_WATERMARK, generate_and_persist_batch, upload_batch};
+        use crate::crypto::prekeys::{PREKEY_LOW_WATERMARK, generate_upload_persist, upload_batch};
 
         let pool = self.inner.store.pool().clone();
         let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM prekeys")
@@ -873,9 +873,9 @@ impl Client {
         let next_id = next_id.0.map(|v| v as u32).unwrap_or(0).saturating_add(1);
 
         let mut rng = rand::rng();
-        let batch = generate_and_persist_batch(&mut rng, &self.inner.store, next_id)
+        let batch = generate_upload_persist(&mut rng, &self.inner.store, next_id)
             .await
-            .map_err(|e| ReceiveError::Stopped(format!("generate_and_persist_batch: {e}")))?;
+            .map_err(|e| ReceiveError::Stopped(format!("generate_upload_persist: {e}")))?;
         upload_batch(&self.inner.store, &batch)
             .await
             .map_err(|e| ReceiveError::Stopped(format!("upload_batch: {e}")))?;

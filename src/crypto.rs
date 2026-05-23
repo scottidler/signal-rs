@@ -9,5 +9,5 @@
 pub mod prekeys;
 pub mod provisioning;
 
-pub use prekeys::{GeneratedBatch, PrekeyError, generate_and_persist_batch, upload_batch};
+pub use prekeys::{GeneratedBatch, PrekeyError, generate_upload_persist, upload_batch};
 pub use provisioning::{ProvisioningCipherError, ProvisioningKeyPair, decrypt_envelope, proto};
