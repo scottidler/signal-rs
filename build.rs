@@ -17,11 +17,15 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/");
 
-    // Generate Rust types from the vendored Provisioning.proto. Signal-Android's
-    // libsignal-service is the canonical source; libsignal-rust does not export
-    // this protobuf. Phase 2 verification settled on vendoring rather than
-    // tracking an unstable upstream re-export path.
+    // Generate Rust types from vendored .proto files. Signal-Android's
+    // libsignal-service is the canonical source; libsignal-rust does not
+    // export these protobufs. Phase 2 verification settled on vendoring
+    // rather than tracking an unstable upstream re-export path.
     println!("cargo:rerun-if-changed=src/proto/provisioning.proto");
-    prost_build::compile_protos(&["src/proto/provisioning.proto"], &["src/proto/"])
-        .expect("failed to compile provisioning.proto");
+    println!("cargo:rerun-if-changed=src/proto/envelope.proto");
+    prost_build::compile_protos(
+        &["src/proto/provisioning.proto", "src/proto/envelope.proto"],
+        &["src/proto/"],
+    )
+    .expect("failed to compile vendored protos");
 }

@@ -38,7 +38,9 @@ use thiserror::Error;
 use zeroize::Zeroize;
 
 pub mod proto {
-    //! prost-generated types from `src/proto/provisioning.proto`.
+    //! prost-generated types from `src/proto/*.proto`. Both
+    //! `provisioning.proto` and `envelope.proto` share package
+    //! `signalservice`; prost emits them into one Rust module.
     include!(concat!(env!("OUT_DIR"), "/signalservice.rs"));
 }
 

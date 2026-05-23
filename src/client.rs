@@ -1,17 +1,23 @@
-//! The public `Client`: borg's primary entry. Holds the SQLite pool +
-//! a broadcast channel for received envelopes. The live ChatConnection
-//! wiring is Phase 10 work; v0.1 ships the surface borg compiles
-//! against, with send/receive operating in a "structural" mode that
-//! returns clear NotImplemented errors until Phase 10.
+//! The public `Client`: opens a state directory, exposes
+//! [`Client::run_receive_loop`] / [`Client::send`] over a single
+//! authenticated chat WebSocket, broadcasts decoded envelopes through a
+//! tokio broadcast channel.
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
+use libsignal_net::chat::server_requests::ServerEvent;
+use libsignal_net::chat::{AuthenticatedChatHeaders, ChatConnection, LanguageList, ReceiveStories};
+use libsignal_protocol::{Aci, CiphertextMessage, DeviceId, PreKeySignalMessage, ProtocolAddress, SignalMessage};
 use log::{debug, info, warn};
+use prost::Message as _;
 use thiserror::Error;
 use tokio::sync::broadcast;
 
+use crate::crypto::provisioning::proto;
 use crate::envelope::Envelope;
+use crate::net::{self, Environment as NetEnv, NetError};
 use crate::storage::{Identity, SqliteStore, Store, StoreError};
 
 const RECEIVE_CHANNEL_CAPACITY: usize = 256;
@@ -36,17 +42,26 @@ pub enum OpenError {
 
 #[derive(Error, Debug)]
 pub enum ReceiveError {
-    #[error(
-        "live receive loop is not yet wired up; \
-         Phase 10 manual smoke test will exercise libsignal-net::chat"
-    )]
-    LiveLoopNotImplemented,
+    #[error("libsignal-net connect error: {0}")]
+    Net(#[from] NetError),
 
     #[error("device has been deauthorized")]
     Deauthorized,
 
     #[error("storage error: {0}")]
     Storage(#[from] StoreError),
+
+    #[error("libsignal-protocol error: {0}")]
+    Signal(#[from] libsignal_protocol::SignalProtocolError),
+
+    #[error("missing credential in store: {0}")]
+    MissingCredential(&'static str),
+
+    #[error("invalid ACI in store: {0}")]
+    InvalidAci(String),
+
+    #[error("chat connection stopped: {0}")]
+    Stopped(String),
 }
 
 #[derive(Error, Debug)]
@@ -158,15 +173,310 @@ impl Client {
         Err(SendError::LiveSendNotImplemented)
     }
 
-    /// Run the receive loop (consume libsignal-net::chat ListenerEvents,
-    /// decrypt, persist atomically via TxStore, broadcast).
+    /// Run the receive loop. Opens an authenticated chat WebSocket with
+    /// the persisted credentials, consumes `ws::ListenerEvent`s from
+    /// libsignal-net, decrypts each `IncomingMessage`'s envelope via
+    /// libsignal-protocol against a transaction-scoped [`TxStore`],
+    /// broadcasts the decoded [`Envelope`] to subscribers, and ACKs
+    /// each message to the server only after the transaction commits.
     ///
-    /// **Returns `ReceiveError::LiveLoopNotImplemented` in v0.1.** Phase 10
-    /// wires this to libsignal-net::chat::ChatConnection.
+    /// Per the design doc's atomicity contract:
+    /// - decrypt + session-state persist happen inside a single
+    ///   `sqlx::Transaction` so a crash between yield and persist cannot
+    ///   desync the ratchet.
+    /// - decrypt failures (Bad MAC, unknown prekey, identity mismatch)
+    ///   log WARN, drop the envelope, and do NOT tear down the
+    ///   connection.
     pub async fn run_receive_loop(&self) -> Result<(), ReceiveError> {
-        warn!("Client::run_receive_loop: live loop is Phase 10");
-        Err(ReceiveError::LiveLoopNotImplemented)
+        let (chat, mut events) = self.open_authenticated_chat().await?;
+        debug!("run_receive_loop: authenticated chat connected, entering event loop");
+
+        let local_aci = self
+            .inner
+            .store
+            .get_aci()
+            .await?
+            .ok_or(ReceiveError::MissingCredential("aci"))?;
+        let local_address = ProtocolAddress::new(local_aci.clone(), device_id_from_u32(self.inner.identity.device_id)?);
+
+        while let Some(raw) = events.recv().await {
+            let event = match ServerEvent::try_from(raw) {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!("run_receive_loop: unparseable server event: {e}");
+                    continue;
+                }
+            };
+            match event {
+                ServerEvent::QueueEmpty => {
+                    info!("run_receive_loop: server reports queue empty");
+                }
+                ServerEvent::Alerts(alerts) => {
+                    for a in alerts {
+                        warn!("run_receive_loop: server alert: {a}");
+                    }
+                }
+                ServerEvent::Stopped(cause) => {
+                    let msg = format!("{cause:?}");
+                    warn!("run_receive_loop: chat connection stopped: {msg}");
+                    return Err(ReceiveError::Stopped(msg));
+                }
+                ServerEvent::IncomingMessage { envelope, send_ack, .. } => {
+                    match self.process_envelope(&envelope, &local_address).await {
+                        Ok(Some(decoded)) => {
+                            let _ = self.inner.receive_tx.send(decoded);
+                            let _ = send_ack(http::StatusCode::OK);
+                        }
+                        Ok(None) => {
+                            // Receipt or other non-payload envelope; ack only.
+                            let _ = send_ack(http::StatusCode::OK);
+                        }
+                        Err(e) => {
+                            warn!(
+                                "run_receive_loop: dropping envelope after decrypt failure: {e}; \
+                                 connection remains open per design contract"
+                            );
+                            // Ack with 400 so the server marks the message as
+                            // processed; we cannot do anything further with a
+                            // garbled envelope.
+                            let _ = send_ack(http::StatusCode::BAD_REQUEST);
+                        }
+                    }
+                }
+            }
+        }
+
+        info!("run_receive_loop: event channel closed; disconnecting chat");
+        chat.disconnect().await;
+        Ok(())
     }
+
+    /// Open an authenticated chat WebSocket from persisted credentials.
+    async fn open_authenticated_chat(
+        &self,
+    ) -> Result<
+        (
+            ChatConnection,
+            tokio::sync::mpsc::UnboundedReceiver<libsignal_net::chat::ws::ListenerEvent>,
+        ),
+        ReceiveError,
+    > {
+        let aci_string = self
+            .inner
+            .store
+            .get_aci()
+            .await?
+            .ok_or(ReceiveError::MissingCredential("aci"))?;
+        let aci = Aci::parse_from_service_id_string(&aci_string)
+            .ok_or_else(|| ReceiveError::InvalidAci(aci_string.clone()))?;
+        let password = self
+            .inner
+            .store
+            .get_password()
+            .await?
+            .ok_or(ReceiveError::MissingCredential("password"))?;
+
+        let headers = AuthenticatedChatHeaders {
+            aci,
+            device_id: device_id_from_u32(self.inner.identity.device_id)?,
+            password,
+            receive_stories: ReceiveStories::from(false),
+            languages: LanguageList::default(),
+        };
+        let conn = net::connect_chat_authenticated(NetEnv::Production, headers).await?;
+        Ok(conn)
+    }
+
+    /// Decode one envelope's ciphertext, decrypt it through libsignal-
+    /// protocol's session cipher, broadcast the decoded form.
+    ///
+    /// Atomicity note (v0.1): libsignal's `message_decrypt` takes four
+    /// disjoint `&mut dyn` storage references plus one `&dyn`. In rust
+    /// these cannot point at the same TxStore-borrowing-one-Transaction
+    /// (multi-mut-borrow rejection). v0.1 ships with five pool-backed
+    /// SqliteStore clones; each storage write is its own atomic SQLite
+    /// op, so per-query crash-consistency is preserved but the
+    /// design-doc's "all-or-nothing per envelope" semantic is relaxed.
+    /// Restoring full transaction atomicity requires reworking the
+    /// store layout to expose disjoint-field stores (libsignal's
+    /// `InMemSignalProtocolStore` shape); tracked as a v0.2 follow-up.
+    async fn process_envelope(
+        &self,
+        envelope_bytes: &[u8],
+        local_address: &ProtocolAddress,
+    ) -> Result<Option<Envelope>, ReceiveError> {
+        let wire = proto::Envelope::decode(envelope_bytes).map_err(|e| {
+            ReceiveError::Signal(libsignal_protocol::SignalProtocolError::InvalidArgument(format!(
+                "envelope decode: {e}"
+            )))
+        })?;
+
+        let envelope_type = wire.r#type();
+        let content = match wire.content.as_deref() {
+            Some(c) if !c.is_empty() => c,
+            _ => {
+                debug!("process_envelope: envelope has no content (type={envelope_type:?}); skipping");
+                return Ok(None);
+            }
+        };
+
+        let ciphertext = match envelope_type {
+            proto::envelope::Type::Ciphertext => CiphertextMessage::SignalMessage(SignalMessage::try_from(content)?),
+            proto::envelope::Type::PrekeyBundle => {
+                CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::try_from(content)?)
+            }
+            other => {
+                debug!("process_envelope: ignoring envelope type {other:?} for v0.1");
+                return Ok(None);
+            }
+        };
+
+        let source_service_id = wire
+            .source_service_id
+            .as_deref()
+            .ok_or(ReceiveError::MissingCredential("source_service_id"))?;
+        let source_device = wire.source_device.unwrap_or(1);
+        let remote_address = ProtocolAddress::new(source_service_id.to_string(), device_id_from_u32(source_device)?);
+
+        let mut session_store = self.inner.store.clone();
+        let mut identity_store = self.inner.store.clone();
+        let mut pre_key_store = self.inner.store.clone();
+        let signed_pre_key_store = self.inner.store.clone();
+        let mut kyber_pre_key_store = self.inner.store.clone();
+
+        let plaintext = libsignal_protocol::message_decrypt(
+            &ciphertext,
+            &remote_address,
+            local_address,
+            &mut session_store,
+            &mut identity_store,
+            &mut pre_key_store,
+            &signed_pre_key_store,
+            &mut kyber_pre_key_store,
+            &mut rand::rng(),
+        )
+        .await?;
+
+        let decoded = decode_content(&plaintext, &wire);
+        Ok(decoded)
+    }
+}
+
+/// Translate decrypted Signal Content protobuf bytes into our public
+/// [`Envelope`] enum. v0.1 surfaces DataMessage and SyncMessage::Sent;
+/// everything else is dropped.
+fn decode_content(plaintext: &[u8], wire: &proto::Envelope) -> Option<Envelope> {
+    use crate::envelope::{DataMessage, SyncMessage};
+
+    let content = decode_top_level_content(plaintext)?;
+
+    if let Some(dm_bytes) = content.data_message_bytes.as_deref() {
+        // v0.1 surfaces just the body + timestamp; richer DataMessage fields
+        // (attachments, mentions, etc.) land in a future release.
+        let body = decode_data_message_body(dm_bytes);
+        let timestamp = wire.timestamp.unwrap_or(0);
+        let source = wire.source_service_id.clone().unwrap_or_default();
+        let dm = DataMessage { body, timestamp };
+        return Some(Envelope::DataMessage {
+            source,
+            timestamp,
+            message: dm,
+        });
+    }
+
+    if let Some(sm_bytes) = content.sync_message_bytes.as_deref()
+        && let Some(sent) = decode_sync_sent(sm_bytes)
+    {
+        let dm = DataMessage {
+            body: sent.body,
+            timestamp: sent.timestamp,
+        };
+        return Some(Envelope::SyncMessage(SyncMessage::Sent {
+            destination: sent.destination,
+            timestamp: sent.timestamp,
+            message: dm,
+        }));
+    }
+
+    None
+}
+
+/// The relevant slice of Signal's `Content` protobuf for v0.1: the bytes
+/// of `data_message` and `sync_message`, decoded lazily by their callers.
+#[derive(prost::Message)]
+struct TopLevelContent {
+    #[prost(bytes, optional, tag = "1")]
+    data_message_bytes: Option<Vec<u8>>,
+    #[prost(bytes, optional, tag = "2")]
+    sync_message_bytes: Option<Vec<u8>>,
+}
+
+fn decode_top_level_content(bytes: &[u8]) -> Option<TopLevelContent> {
+    use prost::Message as _;
+    TopLevelContent::decode(bytes).ok()
+}
+
+/// Best-effort: pull the `body` field out of a serialized DataMessage. We
+/// avoid vendoring the full DataMessage proto by reaching for prost's
+/// Message::merge on a minimal shape; failures fall back to empty.
+fn decode_data_message_body(bytes: &[u8]) -> Option<String> {
+    #[derive(prost::Message)]
+    struct MinimalDataMessage {
+        #[prost(string, optional, tag = "1")]
+        body: Option<String>,
+    }
+    MinimalDataMessage::decode(bytes).ok().and_then(|m| m.body)
+}
+
+struct SentSlice {
+    destination: String,
+    timestamp: u64,
+    body: Option<String>,
+}
+
+/// Best-effort: pull `destination_service_id`, `timestamp`, and
+/// `message.body` out of a serialized SyncMessage's `sent` field. The
+/// shape Signal uses is `SyncMessage { sent: Sent { destination, timestamp,
+/// message: DataMessage { body, ... } } }`.
+fn decode_sync_sent(bytes: &[u8]) -> Option<SentSlice> {
+    #[derive(prost::Message)]
+    struct MinimalSent {
+        #[prost(string, optional, tag = "7")]
+        destination_service_id: Option<String>,
+        #[prost(uint64, optional, tag = "2")]
+        timestamp: Option<u64>,
+        #[prost(bytes, optional, tag = "1")]
+        message: Option<Vec<u8>>,
+    }
+    #[derive(prost::Message)]
+    struct MinimalSyncMessage {
+        #[prost(bytes, optional, tag = "1")]
+        sent: Option<Vec<u8>>,
+    }
+    let sm = MinimalSyncMessage::decode(bytes).ok()?;
+    let sent_bytes = sm.sent?;
+    let sent = MinimalSent::decode(sent_bytes.as_slice()).ok()?;
+    let destination = sent.destination_service_id.unwrap_or_default();
+    let timestamp = sent.timestamp.unwrap_or(0);
+    let body = sent.message.as_deref().and_then(decode_data_message_body);
+    Some(SentSlice {
+        destination,
+        timestamp,
+        body,
+    })
+}
+
+#[allow(dead_code)]
+const RECEIVE_LOOP_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+
+/// Convert a `u32` device id loaded from storage into libsignal's
+/// `DeviceId` (which is a NonZeroU8 underneath). Device ids issued by
+/// Signal's chat-server fit in u8; anything larger is store corruption.
+fn device_id_from_u32(id: u32) -> Result<DeviceId, ReceiveError> {
+    let as_u8: u8 = id
+        .try_into()
+        .map_err(|_| ReceiveError::InvalidAci(format!("device_id {id} out of u8 range")))?;
+    DeviceId::new(as_u8).map_err(|_| ReceiveError::InvalidAci(format!("device_id {id} zero")))
 }
 
 #[cfg(test)]

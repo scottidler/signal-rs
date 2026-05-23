@@ -106,15 +106,9 @@ async fn send_returns_live_send_not_implemented_until_phase_10() {
     }
 }
 
-#[tokio::test]
-async fn run_receive_loop_returns_live_loop_not_implemented_until_phase_10() {
-    let (tmp, _) = linked_state_dir().await;
-    let client = Client::open(tmp.path()).await.unwrap();
-    match client.run_receive_loop().await {
-        Err(ReceiveError::LiveLoopNotImplemented) => {}
-        other => panic!("expected LiveLoopNotImplemented, got {:?}", other),
-    }
-}
+// run_receive_loop now opens a real chat WebSocket against Signal's
+// production servers; it cannot be exercised in unit tests without a
+// live account. Coverage moves to Phase 10's manual smoke test.
 
 #[tokio::test]
 async fn receive_returns_a_subscriber_even_before_loop_is_running() {
