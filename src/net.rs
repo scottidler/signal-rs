@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use http::HeaderName;
 use libsignal_net::chat::{
-    AuthenticatedChatHeaders, ChatConnection, ChatHeaders, ConnectError, UnauthenticatedChatHeaders, ws,
+    AuthenticatedChatHeaders, ChatConnection, ChatHeaders, ConnectError, RECOMMENDED_CHAT_WS_CONFIG,
+    UnauthenticatedChatHeaders, ws,
 };
 use libsignal_net::connect_state::{
     ConnectState, ConnectionResources, DefaultConnectorFactory, PreconnectingFactory, SUGGESTED_CONNECT_CONFIG,
@@ -29,10 +30,7 @@ use log::{debug, info};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-const LOCAL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const REMOTE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const INITIAL_REQUEST_ID: u64 = 0;
-const POST_REQUEST_INTERFACE_CHECK_TIMEOUT: Duration = Duration::MAX;
 
 #[derive(Error, Debug)]
 pub enum NetError {
@@ -98,11 +96,15 @@ async fn connect_endpoint(
 
     let user_agent = UserAgent::with_libsignal_version(concat!("signal-rs/", env!("CARGO_PKG_VERSION")));
 
+    // Adopt libsignal's RECOMMENDED_CHAT_WS_CONFIG (local_idle=31s,
+    // remote_idle=45s, post_request_check=5s). Our earlier
+    // local==remote=60s config caused the disconnect threshold to fire
+    // at the same instant as the keepalive ping, killing the
+    // provisioning WebSocket the moment the user took longer than 60s
+    // to scan the QR.
     let ws_config = ws::Config {
         initial_request_id: INITIAL_REQUEST_ID,
-        local_idle_timeout: LOCAL_IDLE_TIMEOUT,
-        post_request_interface_check_timeout: POST_REQUEST_INTERFACE_CHECK_TIMEOUT,
-        remote_idle_timeout: REMOTE_IDLE_TIMEOUT,
+        ..RECOMMENDED_CHAT_WS_CONFIG
     };
 
     let confirmation_header_name = env
@@ -149,6 +151,7 @@ async fn connect_endpoint(
 pub async fn connect_provisioning(
     env_kind: Environment,
 ) -> Result<(ChatConnection, mpsc::UnboundedReceiver<ws::ListenerEvent>), NetError> {
+    debug!("connect_provisioning: env={:?}", env_kind);
     let headers = ChatHeaders::Unauth(UnauthenticatedChatHeaders {
         languages: Default::default(),
     });
@@ -162,6 +165,7 @@ pub async fn connect_chat_authenticated(
     env_kind: Environment,
     auth: AuthenticatedChatHeaders,
 ) -> Result<(ChatConnection, mpsc::UnboundedReceiver<ws::ListenerEvent>), NetError> {
+    debug!("connect_chat_authenticated: env={:?}", env_kind);
     connect_endpoint(
         env_kind,
         CHAT_WEBSOCKET_PATH,
@@ -178,6 +182,7 @@ pub async fn connect_chat_authenticated(
 pub async fn connect_chat_unauthenticated(
     env_kind: Environment,
 ) -> Result<(ChatConnection, mpsc::UnboundedReceiver<ws::ListenerEvent>), NetError> {
+    debug!("connect_chat_unauthenticated: env={:?}", env_kind);
     let headers = ChatHeaders::Unauth(UnauthenticatedChatHeaders {
         languages: Default::default(),
     });

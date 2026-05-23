@@ -102,13 +102,11 @@ async fn persist_provision_message_writes_identity_at_status_identity_persisted(
     let outcome = persist_provision_message(&store, &msg).await.unwrap();
     assert_eq!(outcome.account_number, "+15555550100");
 
-    // load_identity refuses to return until Linked - confirm the half-linked path.
-    match store.load_identity().await {
-        Err(StoreError::PartiallyLinked {
-            status: LinkStatus::IdentityPersisted,
-        }) => {}
-        other => panic!("expected PartiallyLinked, got {:?}", other),
-    }
+    // load_identity returns the identity with its current status; callers
+    // decide whether to refuse (Client::open) or resume (link()).
+    let partial = store.load_identity().await.unwrap();
+    assert_eq!(partial.link_status, LinkStatus::IdentityPersisted);
+    assert_eq!(partial.account_number, "+15555550100");
 
     mark_linked(&store).await.unwrap();
     let loaded = store.load_identity().await.unwrap();

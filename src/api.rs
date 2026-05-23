@@ -47,35 +47,56 @@ pub enum ApiError {
 
     #[error("rng error: {0}")]
     Rng(String),
+
+    #[error("tls config error: {0}")]
+    TlsConfig(String),
 }
 
-/// JSON body for `PUT /v1/devices/{verification_code}`. Signal's account
-/// attributes for a new secondary device. Field names match Signal's
-/// canonical server API.
+/// JSON body for `PUT /v1/devices/link`. Combines the provisioning
+/// verification code, the account/device attributes, and BOTH identities'
+/// signed + last-resort kyber prekeys into a single atomic PUT. Field
+/// names match the canonical Signal-Server `LinkDeviceRequest` record
+/// (see `entities/LinkDeviceRequest.java`).
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
-struct DeviceAttributes<'a> {
-    name: &'a str,
+struct LinkDeviceRequestBody<'a> {
+    verification_code: &'a str,
+    account_attributes: LinkAccountAttributes,
+    aci_signed_pre_key: SignedPreKeyJson,
+    pni_signed_pre_key: SignedPreKeyJson,
+    aci_pq_last_resort_pre_key: KyberPreKeyJson,
+    pni_pq_last_resort_pre_key: KyberPreKeyJson,
+}
+
+/// Nested `accountAttributes` field inside [`LinkDeviceRequestBody`].
+/// Matches Signal-Server's `entities/DeviceAttributes` JSON shape:
+/// `fetchesMessages` toggles the chat-WebSocket fetch path (true for our
+/// desktop-style secondary), `registrationId`/`pniRegistrationId` are the
+/// libsignal registration IDs we generated and persisted in Phase 5,
+/// `capabilities` MUST be non-null (the controller rejects null with 422)
+/// and MUST deserialize as a `Map<String, Boolean>` per
+/// `DeviceCapabilityAdapter.Deserializer`; we send an empty object `{}`.
+/// `name` is intentionally omitted: the field is `byte[]` server-side
+/// (encrypted device name); we leave it empty for v0.1 since the
+/// linked-devices UI label is cosmetic and Signal's validator accepts a
+/// missing/null name field.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct LinkAccountAttributes {
     fetches_messages: bool,
     registration_id: u32,
     pni_registration_id: u32,
-    capabilities: Capabilities,
-    supports_sms: bool,
+    capabilities: std::collections::HashMap<String, bool>,
 }
 
-#[derive(Serialize, Debug, Default)]
-struct Capabilities {
-    // Empty for v0.1; future versions can advertise gv2/storage/etc. as
-    // libsignal exposes them. Signal accepts a missing or empty object.
-}
-
-/// JSON response shape from `PUT /v1/devices/{verification_code}`.
+/// JSON response shape from `PUT /v1/devices/link`. Matches
+/// Signal-Server's `entities/LinkDeviceResponse`.
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-struct DeviceCompletionResponse {
+struct LinkDeviceResponse {
+    uuid: String,
+    pni: String,
     device_id: u32,
-    // `uuid` and `pni` echo what the primary sent; we already stored those
-    // from the ProvisionMessage so we ignore them on the response.
 }
 
 /// JSON body for `PUT /v2/keys/?identity=aci|pni`. Wire-format mirrors what
@@ -125,38 +146,74 @@ struct KyberPreKeyJson {
     signature: String,
 }
 
-/// Complete the secondary-device registration after the
-/// ProvisioningCipher decrypt step. Mints a password, PUTs the device
-/// attributes to `/v1/devices/{provisioning_code}` with HTTP Basic auth,
-/// stores the response's `device_id` and the minted password.
+/// Pre-generated prekey material for one identity (ACI or PNI). Carries
+/// the signed prekey + last-resort kyber prekey records produced by
+/// [`crate::crypto::prekeys::generate_batch`]; the caller passes both
+/// identities' bundles into [`link_device`] for the combined PUT body.
+pub struct LinkPreKeys<'a> {
+    pub signed_record: &'a libsignal_protocol::SignedPreKeyRecord,
+    pub kyber_record: &'a libsignal_protocol::KyberPreKeyRecord,
+    pub signed_id: u32,
+    pub kyber_id: u32,
+}
+
+/// Complete the secondary-device link via Signal's combined link PUT.
+/// Mints a fresh password, builds a `LinkDeviceRequest` body that carries
+/// device attributes plus the ACI and PNI signed+kyber-last-resort
+/// prekeys, PUTs to `/v1/devices/link` with HTTP Basic auth (password
+/// becomes the device password), stores the server-assigned `device_id`
+/// and the minted password.
+///
+/// The prekeys MUST already be generated and signed by the caller (see
+/// [`crate::crypto::prekeys::generate_batch`]); this function does NOT
+/// touch the prekey lifecycle directly. Caller is responsible for
+/// persisting the full batches locally after this succeeds.
 ///
 /// Returns the server-assigned `device_id`.
-pub async fn complete_device_registration(
+pub async fn link_device(
     store: &SqliteStore,
     provisioning_code: &str,
     device_name: &str,
     number: &str,
-    registration_id: u32,
+    aci_registration_id: u32,
+    pni_registration_id: u32,
+    aci_prekeys: LinkPreKeys<'_>,
+    pni_prekeys: LinkPreKeys<'_>,
 ) -> Result<u32, ApiError> {
     debug!(
-        "complete_device_registration: number={} registration_id={} device_name={}",
-        number, registration_id, device_name
+        "link_device: number={} aci_reg_id={} pni_reg_id={} device_name={} aci_signed_id={} aci_kyber_id={} pni_signed_id={} pni_kyber_id={}",
+        number,
+        aci_registration_id,
+        pni_registration_id,
+        device_name,
+        aci_prekeys.signed_id,
+        aci_prekeys.kyber_id,
+        pni_prekeys.signed_id,
+        pni_prekeys.kyber_id,
     );
 
     let password = mint_password()?;
-    let attrs = DeviceAttributes {
-        name: device_name,
-        fetches_messages: true,
-        registration_id,
-        // For v0.1 we reuse `registration_id` as the PNI registration id;
-        // Signal's server accepts independent PNI id but signal-cli passes
-        // the same value for both on link.
-        pni_registration_id: registration_id,
-        capabilities: Capabilities::default(),
-        supports_sms: false,
+    let body = LinkDeviceRequestBody {
+        verification_code: provisioning_code,
+        account_attributes: LinkAccountAttributes {
+            fetches_messages: true,
+            registration_id: aci_registration_id,
+            pni_registration_id,
+            // `spqr` (SPARSE_POST_QUANTUM_RATCHET) has
+            // `requireForNewDevices=true` AND `preventDowngrade=true` on
+            // Signal-Server's DeviceCapability enum — new linked devices
+            // are rejected with 409 if missing. We advertise it to clear
+            // the check; libsignal-protocol's session machinery handles
+            // SPQR transparently when peers initiate sessions that use it.
+            capabilities: [("spqr".to_string(), true)].into_iter().collect(),
+        },
+        aci_signed_pre_key: signed_prekey_json(&aci_prekeys)?,
+        pni_signed_pre_key: signed_prekey_json(&pni_prekeys)?,
+        aci_pq_last_resort_pre_key: kyber_prekey_json(&aci_prekeys)?,
+        pni_pq_last_resort_pre_key: kyber_prekey_json(&pni_prekeys)?,
     };
 
-    let url = format!("{CHAT_BASE_URL}/v1/devices/{provisioning_code}");
+    let url = format!("{CHAT_BASE_URL}/v1/devices/link");
     let auth_header = basic_auth_header(number, &password);
 
     let client = http_client()?;
@@ -164,7 +221,7 @@ pub async fn complete_device_registration(
         .put(&url)
         .header(AUTHORIZATION, auth_header)
         .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-        .json(&attrs)
+        .json(&body)
         .send()
         .await?;
 
@@ -177,16 +234,43 @@ pub async fn complete_device_registration(
         });
     }
 
-    let parsed: DeviceCompletionResponse = resp.json().await?;
+    let parsed: LinkDeviceResponse = resp.json().await?;
     let device_id = parsed.device_id;
+    debug!(
+        "link_device: server returned uuid={} pni={} device_id={}",
+        parsed.uuid, parsed.pni, device_id
+    );
 
-    // Persist credentials so subsequent calls (keys upload, send, receive)
-    // can pick them up.
     store.set_password(&password).await?;
     store.set_device_id(device_id).await?;
 
-    info!("complete_device_registration: device_id={} assigned", device_id);
+    info!("link_device: device_id={} assigned", device_id);
     Ok(device_id)
+}
+
+/// Extract the JSON form of a signed prekey from its `SignedPreKeyRecord`.
+/// libsignal's `EC` public key serializes to 33 bytes (type byte 0x05 +
+/// 32 bytes raw); the signature is 64 bytes Ed25519. Both are
+/// base64-encoded for the JSON wire.
+fn signed_prekey_json(p: &LinkPreKeys<'_>) -> Result<SignedPreKeyJson, ApiError> {
+    let kp = p.signed_record.key_pair()?;
+    Ok(SignedPreKeyJson {
+        key_id: p.signed_id,
+        public_key: b64(kp.public_key.serialize().as_ref()),
+        signature: b64(p.signed_record.signature()?.as_ref()),
+    })
+}
+
+/// Extract the JSON form of a kyber last-resort prekey from its
+/// `KyberPreKeyRecord`. The Kyber1024 public key serializes to ~1568
+/// bytes; the signature is 64 bytes Ed25519. Both base64-encoded.
+fn kyber_prekey_json(p: &LinkPreKeys<'_>) -> Result<KyberPreKeyJson, ApiError> {
+    let kp = p.kyber_record.key_pair()?;
+    Ok(KyberPreKeyJson {
+        key_id: p.kyber_id,
+        public_key: b64(&kp.public_key.serialize()),
+        signature: b64(p.kyber_record.signature()?.as_ref()),
+    })
 }
 
 /// Pre-fetched credentials needed for the keys-upload PUT. Bundled by
@@ -208,26 +292,27 @@ pub async fn load_upload_credentials(
     store: &SqliteStore,
     identity_kind: IdentityKind,
 ) -> Result<UploadCredentials, ApiError> {
+    debug!("load_upload_credentials: identity_kind={:?}", identity_kind);
     let identity = store.load_identity().await?;
     let password = store
         .get_password()
         .await?
         .ok_or(ApiError::MissingCredential("password"))?;
 
-    let (identity_keypair, service_id) = match identity_kind {
-        IdentityKind::Aci => {
-            let aci = store.get_aci().await?.ok_or(ApiError::MissingCredential("aci"))?;
-            (identity.identity_keypair, aci)
-        }
-        IdentityKind::Pni => {
-            let pni_kp = store
-                .get_pni_identity_keypair()
-                .await?
-                .ok_or(ApiError::MissingCredential("pni_identity_keypair"))?;
-            let pni = store.get_pni().await?.ok_or(ApiError::MissingCredential("pni"))?;
-            (pni_kp, pni)
-        }
+    // Signing identity depends on the kind (ACI prekeys signed by ACI
+    // identity, PNI prekeys signed by PNI identity), but HTTP Basic auth
+    // always uses the ACI-derived service id. The PNI is the URL
+    // discriminator (?identity=pni), not an independent auth principal —
+    // Signal's chat server rejects PNI-as-username with 401 because the
+    // device credentials are bound to the ACI account.
+    let identity_keypair = match identity_kind {
+        IdentityKind::Aci => identity.identity_keypair,
+        IdentityKind::Pni => store
+            .get_pni_identity_keypair()
+            .await?
+            .ok_or(ApiError::MissingCredential("pni_identity_keypair"))?,
     };
+    let service_id = store.get_aci().await?.ok_or(ApiError::MissingCredential("aci"))?;
 
     Ok(UploadCredentials {
         identity_keypair,
@@ -342,6 +427,12 @@ fn build_prekey_upload_body(
     identity_keypair: &libsignal_protocol::IdentityKeyPair,
     batch: &GeneratedBatch,
 ) -> Result<PreKeyUploadBody, ApiError> {
+    debug!(
+        "build_prekey_upload_body: one_time_prekeys={} signed_prekey_id={} kyber_prekey_id={}",
+        batch.one_time_records.len(),
+        batch.signed_prekey_id,
+        batch.kyber_prekey_id
+    );
     let identity_key_b64 = b64(identity_keypair.public_key().serialize().as_ref());
 
     // One-time prekeys: pull the public half straight from each
@@ -402,12 +493,24 @@ fn b64(b: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(b)
 }
 
-/// Construct a fresh reqwest client. We keep this per-call rather than
-/// pooling for v0.1; the link flow issues only two requests and the keys
-/// upload one more, so connection-reuse pressure is low.
+/// Signal's self-signed root CA. chat.signal.org presents a cert chained
+/// to this root, not to any public CA, so we must pin it explicitly.
+/// Sourced from libsignal `rust/net/res/signal.cer` (DER-encoded).
+const SIGNAL_ROOT_CERT_DER: &[u8] = include_bytes!("../res/signal.cer");
+
+/// Construct a fresh reqwest client pinned to Signal's root CA. System
+/// trust roots are excluded; only `SIGNAL_ROOT_CERT_DER` is accepted.
+/// We keep this per-call rather than pooling for v0.1; the link flow
+/// issues only two requests and the keys upload one more, so
+/// connection-reuse pressure is low.
 fn http_client() -> Result<HttpClient, ApiError> {
+    debug!("http_client: building reqwest client with Signal-pinned root CA");
+    let cert = reqwest::Certificate::from_der(SIGNAL_ROOT_CERT_DER)
+        .map_err(|e| ApiError::TlsConfig(format!("parse signal root cert: {e}")))?;
     Ok(HttpClient::builder()
         .user_agent(concat!("signal-rs/", env!("CARGO_PKG_VERSION")))
+        .use_rustls_tls()
+        .tls_certs_only([cert])
         .build()?)
 }
 

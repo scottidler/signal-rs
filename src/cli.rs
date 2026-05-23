@@ -1,15 +1,32 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::sync::LazyLock;
+
+static AFTER_HELP: LazyLock<String> = LazyLock::new(after_help_text);
+
+fn after_help_text() -> String {
+    let state_dir = dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("signal-rs");
+    let log_path = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("signal-rs")
+        .join("logs")
+        .join("signal-rs.log");
+    format!(
+        "PATHS:\n  State dir: {state_dir}\n  Log file:  {log_path}",
+        state_dir = state_dir.display(),
+        log_path = log_path.display(),
+    )
+}
 
 #[derive(Parser)]
 #[command(
     name = "signal-rs",
     about = "Native-Rust Signal client - v0.1 unblocks borg Note-to-Self ingest",
-    long_about = "Native-Rust Signal client. v0.1 ships the surface needed to link\n\
-                  as a secondary device, receive Signal envelopes, and send a 1:1 text message.\n\
-                  The live network paths (link/send/receive) are wired in Phase 10's manual\n\
-                  smoke test - they will currently exit with `not implemented`.",
+    long_about = "Native-Rust Signal client. Link as a secondary device, receive Signal\n\
+                  envelopes, and send a 1:1 text message. Note-to-Self is the primary\n\
+                  use case for borg ingest.",
     version = env!("GIT_DESCRIBE"),
+    after_help = AFTER_HELP.as_str(),
 )]
 pub struct Cli {
     /// Override the state directory. Defaults to $XDG_DATA_HOME/signal-rs
@@ -28,11 +45,9 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Link this host as a secondary device on the user's existing
-    /// Signal account. Renders a `sgnl://` provisioning URI as a QR
-    /// code; the primary device scans it to complete linking.
-    ///
-    /// Currently returns `LiveServerNotImplemented` - Phase 10 wires
-    /// this to libsignal-net::chat's provisioning WebSocket.
+    /// Signal account. Renders a `sgnl://` provisioning URI as both a
+    /// PNG (at <state_dir>/link-qr.png) and ANSI to stdout; the primary
+    /// device scans it to complete linking.
     Link {
         /// Friendly name shown in the primary's Linked Devices list.
         #[arg(long, default_value = "signal-rs")]
@@ -41,9 +56,6 @@ pub enum Command {
 
     /// Send a 1:1 text message. Pass your own E.164 to fan out a
     /// Note-to-Self.
-    ///
-    /// Currently returns `LiveSendNotImplemented` - Phase 10 wires
-    /// this to libsignal-net-chat::AuthenticatedChatApi.
     Send {
         /// Recipient E.164 number (e.g. +15555550100).
         target: String,
@@ -51,14 +63,11 @@ pub enum Command {
         message: String,
     },
 
-    /// Drain a single envelope from the receive loop and print it to
-    /// stdout as pretty JSON, then exit. Smoke-test helper.
-    ///
-    /// Currently returns `LiveLoopNotImplemented` - Phase 10 wires
-    /// this to libsignal-net::chat's ChatConnection.
+    /// Run the receive loop, decrypting incoming envelopes and printing
+    /// them to stdout as pretty JSON.
     Receive {
-        /// Only print one envelope and exit. v0.1 only supports this
-        /// mode; long-running daemon mode is a later version.
+        /// Print one envelope and exit instead of looping. Smoke-test
+        /// helper.
         #[arg(long)]
         once: bool,
     },

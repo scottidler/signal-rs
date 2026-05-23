@@ -12,7 +12,7 @@ use libsignal_net::chat::{AuthenticatedChatHeaders, ChatConnection, LanguageList
 use libsignal_protocol::{
     Aci, CiphertextMessage, DeviceId, PreKeySignalMessage, ProtocolAddress, SessionStore, SignalMessage,
 };
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 use prost::Message as _;
 use thiserror::Error;
 use tokio::sync::broadcast;
@@ -20,7 +20,7 @@ use tokio::sync::broadcast;
 use crate::crypto::provisioning::proto;
 use crate::envelope::Envelope;
 use crate::net::{self, Environment as NetEnv, NetError};
-use crate::storage::{Identity, SqliteStore, Store, StoreError};
+use crate::storage::{Identity, LinkStatus, SqliteStore, Store, StoreError};
 
 const RECEIVE_CHANNEL_CAPACITY: usize = 256;
 
@@ -130,9 +130,11 @@ impl Client {
         let identity = match store.load_identity().await {
             Ok(id) => id,
             Err(StoreError::NotLinked) => return Err(OpenError::NotLinked),
-            Err(StoreError::PartiallyLinked { .. }) => return Err(OpenError::PartiallyLinked),
             Err(e) => return Err(OpenError::Storage(e)),
         };
+        if identity.link_status != LinkStatus::Linked {
+            return Err(OpenError::PartiallyLinked);
+        }
 
         let (receive_tx, _) = broadcast::channel(RECEIVE_CHANNEL_CAPACITY);
         info!(
@@ -382,7 +384,9 @@ impl Client {
     }
 
     fn is_note_to_self(&self, target: &str) -> bool {
-        target == self.inner.identity.account_number
+        let result = target == self.inner.identity.account_number;
+        trace!("is_note_to_self: target={} result={}", target, result);
+        result
     }
 
     /// Encrypt a Note-to-Self transcript to each of the user's OTHER
@@ -407,6 +411,7 @@ impl Client {
     /// `sqlx::Transaction` via TxStore, matching the receive-side
     /// contract.
     async fn send_note_to_self(&self, body: &str) -> Result<(), SendError> {
+        debug!("send_note_to_self: body_len={}", body.len());
         use libsignal_net_chat::api::keys::{DeviceSpecifier, UnauthenticatedChatApi};
         use libsignal_net_chat::api::messages::{AuthenticatedChatApi, SingleOutboundUnsealedMessage};
         use libsignal_net_chat::api::{Auth, Unauth, UserBasedAuthorization};
@@ -602,6 +607,10 @@ impl Client {
     ///   log WARN, drop the envelope, and do NOT tear down the
     ///   connection.
     pub async fn run_receive_loop(&self) -> Result<(), ReceiveError> {
+        debug!(
+            "run_receive_loop: account={} device_id={}",
+            self.inner.identity.account_number, self.inner.identity.device_id
+        );
         let (chat, mut events) = self.open_authenticated_chat().await?;
         debug!("run_receive_loop: authenticated chat connected, entering event loop");
 
@@ -681,6 +690,7 @@ impl Client {
         ),
         ReceiveError,
     > {
+        debug!("open_authenticated_chat: device_id={}", self.inner.identity.device_id);
         let aci_string = self
             .inner
             .store
@@ -724,6 +734,11 @@ impl Client {
         envelope_bytes: &[u8],
         local_address: &ProtocolAddress,
     ) -> Result<Option<Envelope>, ReceiveError> {
+        debug!(
+            "process_envelope: envelope_len={} local_address={}",
+            envelope_bytes.len(),
+            local_address
+        );
         let wire = proto::Envelope::decode(envelope_bytes).map_err(|e| {
             ReceiveError::Signal(libsignal_protocol::SignalProtocolError::InvalidArgument(format!(
                 "envelope decode: {e}"
@@ -795,6 +810,11 @@ impl Client {
 /// [`Envelope`] enum. v0.1 surfaces DataMessage and SyncMessage::Sent;
 /// everything else is dropped.
 fn decode_content(plaintext: &[u8], wire: &proto::Envelope) -> Option<Envelope> {
+    debug!(
+        "decode_content: plaintext_len={} envelope_type={:?}",
+        plaintext.len(),
+        wire.r#type()
+    );
     use crate::envelope::{DataMessage, SyncMessage};
 
     let content = decode_top_level_content(plaintext)?;
@@ -841,6 +861,7 @@ struct TopLevelContent {
 }
 
 fn decode_top_level_content(bytes: &[u8]) -> Option<TopLevelContent> {
+    trace!("decode_top_level_content: bytes_len={}", bytes.len());
     use prost::Message as _;
     TopLevelContent::decode(bytes).ok()
 }
@@ -849,6 +870,7 @@ fn decode_top_level_content(bytes: &[u8]) -> Option<TopLevelContent> {
 /// avoid vendoring the full DataMessage proto by reaching for prost's
 /// Message::merge on a minimal shape; failures fall back to empty.
 fn decode_data_message_body(bytes: &[u8]) -> Option<String> {
+    trace!("decode_data_message_body: bytes_len={}", bytes.len());
     #[derive(prost::Message)]
     struct MinimalDataMessage {
         #[prost(string, optional, tag = "1")]
@@ -868,6 +890,7 @@ struct SentSlice {
 /// shape Signal uses is `SyncMessage { sent: Sent { destination, timestamp,
 /// message: DataMessage { body, ... } } }`.
 fn decode_sync_sent(bytes: &[u8]) -> Option<SentSlice> {
+    trace!("decode_sync_sent: bytes_len={}", bytes.len());
     #[derive(prost::Message)]
     struct MinimalSent {
         #[prost(string, optional, tag = "7")]
@@ -917,6 +940,7 @@ impl Client {
     /// had, which is a good time to ensure the next inbound peer has
     /// keys to start a session.
     async fn maybe_replenish_prekeys(&self) -> Result<(), ReceiveError> {
+        debug!("maybe_replenish_prekeys:");
         use crate::crypto::prekeys::IdentityKind;
 
         // Per-identity replenishment, against the SERVER's authoritative
@@ -925,22 +949,39 @@ impl Client {
         // local store has no way to observe that consumption until the
         // resulting message arrives. signal-cli's
         // PreKeyHelper.refreshPreKeysIfNecessary uses the same pattern.
+        //
+        // ACI and PNI live in disjoint local id ranges (PNI starts at
+        // PNI_ID_OFFSET == 2^23) so each identity's replenishment
+        // resumes from its own MAX. A single shared MAX would push ACI
+        // ids into the PNI range on the first refill cycle, colliding
+        // exactly the way the link path used to.
+        const PNI_ID_OFFSET: u32 = 1 << 23;
         let pool = self.inner.store.pool().clone();
-        let next_id: (Option<i64>,) = sqlx::query_as("SELECT MAX(id) FROM prekeys")
+        let aci_max: (Option<i64>,) = sqlx::query_as("SELECT MAX(id) FROM prekeys WHERE id < ?")
+            .bind(PNI_ID_OFFSET as i64)
             .fetch_one(&pool)
             .await
             .map_err(StoreError::from)?;
-        let next_id = next_id.0.map(|v| v as u32).unwrap_or(0).saturating_add(1);
+        let aci_next = aci_max.0.map(|v| v as u32).unwrap_or(0).saturating_add(1);
+        let pni_max: (Option<i64>,) = sqlx::query_as("SELECT MAX(id) FROM prekeys WHERE id >= ?")
+            .bind(PNI_ID_OFFSET as i64)
+            .fetch_one(&pool)
+            .await
+            .map_err(StoreError::from)?;
+        let pni_next = pni_max.0.map(|v| v as u32).unwrap_or(PNI_ID_OFFSET).saturating_add(1);
 
         let mut rng = rand::rng();
-        self.maybe_replenish_one_identity(IdentityKind::Aci, &mut rng, next_id)
+        self.maybe_replenish_one_identity(IdentityKind::Aci, &mut rng, aci_next)
             .await?;
         if self.inner.store.get_pni_identity_keypair().await?.is_some() {
-            self.maybe_replenish_one_identity(IdentityKind::Pni, &mut rng, next_id)
+            self.maybe_replenish_one_identity(IdentityKind::Pni, &mut rng, pni_next)
                 .await?;
         }
 
-        info!("maybe_replenish_prekeys: cycle complete (next_id={})", next_id);
+        info!(
+            "maybe_replenish_prekeys: cycle complete aci_next={} pni_next={}",
+            aci_next, pni_next
+        );
         Ok(())
     }
 
@@ -954,6 +995,10 @@ impl Client {
         rng: &mut R,
         next_id: u32,
     ) -> Result<(), ReceiveError> {
+        debug!(
+            "maybe_replenish_one_identity: identity_kind={:?} next_id={}",
+            identity_kind, next_id
+        );
         use crate::crypto::prekeys::{PREKEY_LOW_WATERMARK, generate_upload_persist};
 
         // Pre-fetch upload credentials (also needed for the count
@@ -990,6 +1035,11 @@ impl Client {
 /// Build the inner Content protobuf for a 1:1 send: a DataMessage with
 /// the body and timestamp, wrapped in the top-level Content.
 fn build_one_to_one_content(body: &str, timestamp: u64) -> Vec<u8> {
+    debug!(
+        "build_one_to_one_content: body_len={} timestamp={}",
+        body.len(),
+        timestamp
+    );
     use prost::Message as _;
 
     #[derive(prost::Message)]
@@ -1019,6 +1069,12 @@ fn build_one_to_one_content(body: &str, timestamp: u64) -> Vec<u8> {
 /// body as a DataMessage and tags it via SyncMessage::Sent so the
 /// receiver-side filter (`destination == own_number`) fires.
 fn build_sync_self_content(body: &str, own_destination: &str, timestamp: u64) -> Vec<u8> {
+    debug!(
+        "build_sync_self_content: body_len={} own_destination={} timestamp={}",
+        body.len(),
+        own_destination,
+        timestamp
+    );
     use prost::Message as _;
 
     #[derive(prost::Message)]

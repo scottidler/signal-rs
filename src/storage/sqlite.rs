@@ -8,7 +8,7 @@ use libsignal_protocol::{
     KyberPreKeyRecord, KyberPreKeyStore, PreKeyId, PreKeyRecord, PreKeyStore, ProtocolAddress, PublicKey,
     SessionRecord, SessionStore, SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
 };
-use log::{debug, warn};
+use log::{debug, trace};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
@@ -68,6 +68,7 @@ impl SqliteStore {
     }
 
     async fn get_identity_value(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        trace!("get_identity_value: key={}", key);
         let row = sqlx::query("SELECT value FROM identity WHERE key = ?")
             .bind(key)
             .fetch_optional(&self.pool)
@@ -76,6 +77,7 @@ impl SqliteStore {
     }
 
     async fn put_identity_value(&self, key: &str, value: &[u8]) -> Result<(), StoreError> {
+        trace!("put_identity_value: key={} value_len={}", key, value.len());
         sqlx::query("INSERT OR REPLACE INTO identity (key, value) VALUES (?, ?)")
             .bind(key)
             .bind(value)
@@ -88,6 +90,7 @@ impl SqliteStore {
     /// `password` half of HTTP Basic auth on every authenticated call to
     /// `chat.signal.org`.
     pub async fn set_password(&self, password: &str) -> Result<(), StoreError> {
+        debug!("set_password: password_len={}", password.len());
         self.put_identity_value(IDENTITY_KEY_PASSWORD, password.as_bytes())
             .await
     }
@@ -95,6 +98,7 @@ impl SqliteStore {
     /// Load the device password. `None` if linking has not reached the
     /// device-completion step.
     pub async fn get_password(&self) -> Result<Option<String>, StoreError> {
+        debug!("get_password:");
         match self.get_identity_value(IDENTITY_KEY_PASSWORD).await? {
             Some(bytes) => Ok(Some(
                 String::from_utf8(bytes).map_err(|e| StoreError::Corrupt(format!("password utf8: {e}")))?,
@@ -106,6 +110,7 @@ impl SqliteStore {
     /// Overwrite device_id - used by the device-completion step in `link()`
     /// once Signal's server has assigned us a real device id.
     pub async fn set_device_id(&self, device_id: u32) -> Result<(), StoreError> {
+        debug!("set_device_id: device_id={}", device_id);
         self.put_identity_value(IDENTITY_KEY_DEVICE_ID, &device_id.to_be_bytes())
             .await
     }
@@ -113,11 +118,13 @@ impl SqliteStore {
     /// Persist the ACI (account identifier UUID string). Stored as a sibling
     /// of `account_number` (E.164); the Signal protocol uses ACI for routing.
     pub async fn set_aci(&self, aci: &str) -> Result<(), StoreError> {
+        debug!("set_aci: aci={}", aci);
         self.put_identity_value(IDENTITY_KEY_ACI, aci.as_bytes()).await
     }
 
     /// Load the persisted ACI string, if any.
     pub async fn get_aci(&self) -> Result<Option<String>, StoreError> {
+        debug!("get_aci:");
         match self.get_identity_value(IDENTITY_KEY_ACI).await? {
             Some(bytes) => Ok(Some(
                 String::from_utf8(bytes).map_err(|e| StoreError::Corrupt(format!("aci utf8: {e}")))?,
@@ -129,11 +136,13 @@ impl SqliteStore {
     /// Persist the PNI (phone-number identifier UUID string), if the
     /// ProvisionMessage carried one.
     pub async fn set_pni(&self, pni: &str) -> Result<(), StoreError> {
+        debug!("set_pni: pni={}", pni);
         self.put_identity_value(IDENTITY_KEY_PNI, pni.as_bytes()).await
     }
 
     /// Load the persisted PNI string, if any.
     pub async fn get_pni(&self) -> Result<Option<String>, StoreError> {
+        debug!("get_pni:");
         match self.get_identity_value(IDENTITY_KEY_PNI).await? {
             Some(bytes) => Ok(Some(
                 String::from_utf8(bytes).map_err(|e| StoreError::Corrupt(format!("pni utf8: {e}")))?,
@@ -145,11 +154,13 @@ impl SqliteStore {
     /// Persist the profile key from the ProvisionMessage. Required for
     /// upload-the-profile-name and Note-to-Self decoding paths.
     pub async fn set_profile_key(&self, profile_key: &[u8]) -> Result<(), StoreError> {
+        debug!("set_profile_key: len={}", profile_key.len());
         self.put_identity_value(IDENTITY_KEY_PROFILE_KEY, profile_key).await
     }
 
     /// Load the persisted profile key.
     pub async fn get_profile_key(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        debug!("get_profile_key:");
         self.get_identity_value(IDENTITY_KEY_PROFILE_KEY).await
     }
 
@@ -159,12 +170,14 @@ impl SqliteStore {
     /// device registration. Cleared after a successful PUT to
     /// `/v1/devices/{code}`.
     pub async fn set_provisioning_code(&self, code: &str) -> Result<(), StoreError> {
+        debug!("set_provisioning_code: code_len={}", code.len());
         self.put_identity_value(IDENTITY_KEY_PROVISIONING_CODE, code.as_bytes())
             .await
     }
 
     /// Load the persisted provisioning code, if any.
     pub async fn get_provisioning_code(&self) -> Result<Option<String>, StoreError> {
+        debug!("get_provisioning_code:");
         match self.get_identity_value(IDENTITY_KEY_PROVISIONING_CODE).await? {
             Some(bytes) => {
                 Ok(Some(String::from_utf8(bytes).map_err(|e| {
@@ -180,12 +193,14 @@ impl SqliteStore {
     /// separate prekey batch per identity. Stored under a distinct key
     /// from the (ACI) identity_keypair slot.
     pub async fn set_pni_identity_keypair(&self, kp: &IdentityKeyPair) -> Result<(), StoreError> {
+        debug!("set_pni_identity_keypair:");
         let bytes = kp.serialize();
         self.put_identity_value(IDENTITY_KEY_PNI_KEYPAIR, &bytes).await
     }
 
     /// Load the PNI identity keypair, if persisted.
     pub async fn get_pni_identity_keypair(&self) -> Result<Option<IdentityKeyPair>, StoreError> {
+        debug!("get_pni_identity_keypair:");
         match self.get_identity_value(IDENTITY_KEY_PNI_KEYPAIR).await? {
             Some(bytes) => Ok(Some(IdentityKeyPair::try_from(&bytes[..])?)),
             None => Ok(None),
@@ -196,6 +211,7 @@ impl SqliteStore {
     /// Signal's server only accepts each provisioning code once; keeping
     /// it around invites a retry that the server would 409.
     pub async fn clear_provisioning_code(&self) -> Result<(), StoreError> {
+        debug!("clear_provisioning_code:");
         sqlx::query("DELETE FROM identity WHERE key = ?")
             .bind(IDENTITY_KEY_PROVISIONING_CODE)
             .execute(&self.pool)
@@ -210,6 +226,7 @@ impl SqliteStore {
     /// of the recipient's one-time prekeys) when we already have
     /// established sessions for the target.
     pub async fn session_device_ids_for_service_id(&self, service_id_string: &str) -> Result<Vec<u32>, StoreError> {
+        debug!("session_device_ids_for_service_id: service_id={}", service_id_string);
         let prefix = format!("{service_id_string}.");
         let rows = sqlx::query("SELECT address FROM sessions WHERE address LIKE ?")
             .bind(format!("{prefix}%"))
@@ -307,10 +324,7 @@ impl Store for SqliteStore {
         let link_status = LinkStatus::from_str(status_str)
             .ok_or_else(|| StoreError::Corrupt(format!("link_status value {status_str}")))?;
 
-        if link_status != LinkStatus::Linked {
-            warn!("load_identity: partially linked status={:?}", link_status);
-            return Err(StoreError::PartiallyLinked { status: link_status });
-        }
+        debug!("load_identity: loaded status={:?}", link_status);
 
         Ok(Identity {
             identity_keypair,
@@ -342,6 +356,7 @@ fn map_sqlx(e: sqlx::Error) -> SignalProtocolError {
 #[async_trait(?Send)]
 impl IdentityKeyStore for SqliteStore {
     async fn get_identity_key_pair(&self) -> Result<IdentityKeyPair, SignalProtocolError> {
+        trace!("get_identity_key_pair:");
         let bytes = self
             .get_identity_value(IDENTITY_KEY_KEYPAIR)
             .await
@@ -351,6 +366,7 @@ impl IdentityKeyStore for SqliteStore {
     }
 
     async fn get_local_registration_id(&self) -> Result<u32, SignalProtocolError> {
+        trace!("get_local_registration_id:");
         let bytes = self
             .get_identity_value(IDENTITY_KEY_REGISTRATION_ID)
             .await
@@ -396,6 +412,7 @@ impl IdentityKeyStore for SqliteStore {
         identity: &IdentityKey,
         _direction: Direction,
     ) -> Result<bool, SignalProtocolError> {
+        trace!("is_trusted_identity: address={}", address);
         let row = sqlx::query("SELECT key FROM identities WHERE address = ?")
             .bind(address.to_string())
             .fetch_optional(&self.pool)
@@ -411,6 +428,7 @@ impl IdentityKeyStore for SqliteStore {
     }
 
     async fn get_identity(&self, address: &ProtocolAddress) -> Result<Option<IdentityKey>, SignalProtocolError> {
+        trace!("get_identity: address={}", address);
         let row = sqlx::query("SELECT key FROM identities WHERE address = ?")
             .bind(address.to_string())
             .fetch_optional(&self.pool)
@@ -429,6 +447,7 @@ impl IdentityKeyStore for SqliteStore {
 #[async_trait(?Send)]
 impl SessionStore for SqliteStore {
     async fn load_session(&self, address: &ProtocolAddress) -> Result<Option<SessionRecord>, SignalProtocolError> {
+        trace!("load_session: address={}", address);
         let row = sqlx::query("SELECT record FROM sessions WHERE address = ?")
             .bind(address.to_string())
             .fetch_optional(&self.pool)
@@ -464,6 +483,7 @@ impl SessionStore for SqliteStore {
 impl PreKeyStore for SqliteStore {
     async fn get_pre_key(&self, prekey_id: PreKeyId) -> Result<PreKeyRecord, SignalProtocolError> {
         let id: u32 = prekey_id.into();
+        trace!("get_pre_key: id={}", id);
         let row = sqlx::query("SELECT record FROM prekeys WHERE id = ?")
             .bind(id as i64)
             .fetch_optional(&self.pool)
@@ -506,6 +526,7 @@ impl SignedPreKeyStore for SqliteStore {
         signed_prekey_id: SignedPreKeyId,
     ) -> Result<SignedPreKeyRecord, SignalProtocolError> {
         let id: u32 = signed_prekey_id.into();
+        trace!("get_signed_pre_key: id={}", id);
         let row = sqlx::query("SELECT record FROM signed_prekeys WHERE id = ?")
             .bind(id as i64)
             .fetch_optional(&self.pool)
@@ -541,6 +562,7 @@ impl KyberPreKeyStore for SqliteStore {
         kyber_prekey_id: KyberPreKeyId,
     ) -> Result<KyberPreKeyRecord, SignalProtocolError> {
         let id: u32 = kyber_prekey_id.into();
+        trace!("get_kyber_pre_key: id={}", id);
         let row = sqlx::query("SELECT record FROM kyber_prekeys WHERE id = ?")
             .bind(id as i64)
             .fetch_optional(&self.pool)

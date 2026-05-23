@@ -62,14 +62,41 @@ async fn main() -> Result<()> {
             // Live linking against Signal. Renders the provisioning URI
             // as a QR code so the operator can scan it from their primary
             // device's Linked Devices screen.
+            let state_dir_for_qr = state_dir.clone();
             let outcome = link(&state_dir, &name, |uri| {
                 println!();
                 println!("Scan this with your primary device (Settings -> Linked Devices):");
                 println!();
+                // Render two ways:
+                //   1. PNG file the operator can open in any image
+                //      viewer. Reliable across terminals.
+                //   2. ANSI block QR in stdout as a fallback.
                 if let Ok(code) = qrcode::QrCode::new(uri.as_bytes()) {
+                    // PNG version
+                    let png_path = state_dir_for_qr.join("link-qr.png");
+                    let image = code.render::<image::Luma<u8>>().min_dimensions(512, 512).build();
+                    match image.save(&png_path) {
+                        Ok(()) => {
+                            println!("QR saved to: {}", png_path.display());
+                            println!("Open it: xdg-open {}", png_path.display());
+                            println!();
+                        }
+                        Err(e) => println!("(warning: could not save QR PNG: {e})"),
+                    }
+
+                    // ANSI block fallback in stdout, in case the user
+                    // wants to scan from terminal. Renders the
+                    // module-as-two-spaces variant (full-width blocks
+                    // at full height) - far more robust than Dense1x2
+                    // across terminals.
+                    println!("ANSI fallback (scan from terminal if PNG opens are not convenient):");
+                    println!();
                     let rendered = code
-                        .render::<qrcode::render::unicode::Dense1x2>()
+                        .render::<char>()
                         .quiet_zone(true)
+                        .module_dimensions(2, 1)
+                        .light_color(' ')
+                        .dark_color('█')
                         .build();
                     println!("{rendered}");
                 }
@@ -118,10 +145,37 @@ async fn main() -> Result<()> {
                     }
                 }
             } else {
-                client
-                    .run_receive_loop()
-                    .await
-                    .map_err(|e| eyre!("Client::run_receive_loop: {e}"))?;
+                // Long-running mode: subscribe to the broadcast channel
+                // and print every decoded envelope while the receive
+                // loop runs in parallel. libsignal-protocol's storage
+                // futures are !Send so we can't spawn the loop on a
+                // separate task; tokio::select! co-runs both on the
+                // current task. Without the explicit rx.recv() arm
+                // envelopes are silently dropped — broadcast::send is
+                // a no-op when no receivers are attached.
+                let mut rx = client.receive();
+                let loop_fut = client.run_receive_loop();
+                tokio::pin!(loop_fut);
+                loop {
+                    tokio::select! {
+                        msg = rx.recv() => {
+                            match msg {
+                                Ok(envelope) => println!("{envelope:#?}"),
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    eprintln!("receive: lagged, dropped {n} envelopes");
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    eprintln!("receive: channel closed");
+                                    break;
+                                }
+                            }
+                        }
+                        res = &mut loop_fut => {
+                            res.map_err(|e| eyre!("run_receive_loop: {e}"))?;
+                            break;
+                        }
+                    }
+                }
             }
             Ok(())
         }

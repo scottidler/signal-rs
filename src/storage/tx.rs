@@ -58,7 +58,7 @@ use libsignal_protocol::{
     KyberPreKeyRecord, KyberPreKeyStore, PreKeyId, PreKeyRecord, PreKeyStore, ProtocolAddress, PublicKey,
     SessionRecord, SessionStore, SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
 };
-use log::debug;
+use log::{debug, trace};
 use sqlx::{Row, Sqlite, Transaction};
 use tokio::sync::Mutex;
 
@@ -93,6 +93,7 @@ impl TxStore {
     /// Commit the underlying transaction. Returns an error if the
     /// transaction has already been taken (programmer error).
     pub async fn commit(self) -> Result<(), sqlx::Error> {
+        debug!("TxStore::commit:");
         let mut guard = self.inner.lock().await;
         let tx = guard
             .take()
@@ -167,6 +168,7 @@ async fn load_session_impl(
     inner: &TxRef,
     address: &ProtocolAddress,
 ) -> Result<Option<SessionRecord>, SignalProtocolError> {
+    trace!("TxStore::load_session: address={}", address);
     let mut guard = inner.lock().await;
     let tx = guard.as_mut().ok_or_else(tx_drained)?;
     let row = sqlx::query("SELECT record FROM sessions WHERE address = ?")
@@ -234,6 +236,7 @@ impl SessionStore for TxStore {
 // =============================================================================
 
 async fn get_identity_key_pair_impl(inner: &TxRef) -> Result<IdentityKeyPair, SignalProtocolError> {
+    trace!("TxStore::get_identity_key_pair:");
     let mut guard = inner.lock().await;
     let tx = guard.as_mut().ok_or_else(tx_drained)?;
     let row = sqlx::query("SELECT value FROM identity WHERE key = 'identity_keypair'")
@@ -246,6 +249,7 @@ async fn get_identity_key_pair_impl(inner: &TxRef) -> Result<IdentityKeyPair, Si
 }
 
 async fn get_local_registration_id_impl(inner: &TxRef) -> Result<u32, SignalProtocolError> {
+    trace!("TxStore::get_local_registration_id:");
     let mut guard = inner.lock().await;
     let tx = guard.as_mut().ok_or_else(tx_drained)?;
     let row = sqlx::query("SELECT value FROM identity WHERE key = 'registration_id'")
@@ -295,6 +299,7 @@ async fn is_trusted_identity_impl(
     address: &ProtocolAddress,
     identity: &IdentityKey,
 ) -> Result<bool, SignalProtocolError> {
+    trace!("TxStore::is_trusted_identity: address={}", address);
     let mut guard = inner.lock().await;
     let tx = guard.as_mut().ok_or_else(tx_drained)?;
     let row = sqlx::query("SELECT key FROM identities WHERE address = ?")
@@ -315,6 +320,7 @@ async fn get_identity_impl(
     inner: &TxRef,
     address: &ProtocolAddress,
 ) -> Result<Option<IdentityKey>, SignalProtocolError> {
+    trace!("TxStore::get_identity: address={}", address);
     let mut guard = inner.lock().await;
     let tx = guard.as_mut().ok_or_else(tx_drained)?;
     let row = sqlx::query("SELECT key FROM identities WHERE address = ?")
@@ -393,6 +399,7 @@ impl IdentityKeyStore for TxStore {
 
 async fn get_pre_key_impl(inner: &TxRef, prekey_id: PreKeyId) -> Result<PreKeyRecord, SignalProtocolError> {
     let id: u32 = prekey_id.into();
+    trace!("TxStore::get_pre_key: id={}", id);
     let mut guard = inner.lock().await;
     let tx = guard.as_mut().ok_or_else(tx_drained)?;
     let row = sqlx::query("SELECT record FROM prekeys WHERE id = ?")
@@ -411,6 +418,7 @@ async fn save_pre_key_impl(
     record: &PreKeyRecord,
 ) -> Result<(), SignalProtocolError> {
     let id: u32 = prekey_id.into();
+    debug!("TxStore::save_pre_key: id={}", id);
     let bytes = record.serialize()?;
     let mut guard = inner.lock().await;
     let tx = guard.as_mut().ok_or_else(tx_drained)?;
@@ -471,6 +479,7 @@ async fn get_signed_pre_key_impl(
     signed_prekey_id: SignedPreKeyId,
 ) -> Result<SignedPreKeyRecord, SignalProtocolError> {
     let id: u32 = signed_prekey_id.into();
+    trace!("TxStore::get_signed_pre_key: id={}", id);
     let mut guard = inner.lock().await;
     let tx = guard.as_mut().ok_or_else(tx_drained)?;
     let row = sqlx::query("SELECT record FROM signed_prekeys WHERE id = ?")
@@ -489,6 +498,7 @@ async fn save_signed_pre_key_impl(
     record: &SignedPreKeyRecord,
 ) -> Result<(), SignalProtocolError> {
     let id: u32 = signed_prekey_id.into();
+    debug!("TxStore::save_signed_pre_key: id={}", id);
     let bytes = record.serialize()?;
     let mut guard = inner.lock().await;
     let tx = guard.as_mut().ok_or_else(tx_drained)?;
@@ -544,6 +554,7 @@ async fn get_kyber_pre_key_impl(
     kyber_prekey_id: KyberPreKeyId,
 ) -> Result<KyberPreKeyRecord, SignalProtocolError> {
     let id: u32 = kyber_prekey_id.into();
+    trace!("TxStore::get_kyber_pre_key: id={}", id);
     let mut guard = inner.lock().await;
     let tx = guard.as_mut().ok_or_else(tx_drained)?;
     let row = sqlx::query("SELECT record FROM kyber_prekeys WHERE id = ?")
@@ -562,6 +573,7 @@ async fn save_kyber_pre_key_impl(
     record: &KyberPreKeyRecord,
 ) -> Result<(), SignalProtocolError> {
     let id: u32 = kyber_prekey_id.into();
+    debug!("TxStore::save_kyber_pre_key: id={}", id);
     let bytes = record.serialize()?;
     let mut guard = inner.lock().await;
     let tx = guard.as_mut().ok_or_else(tx_drained)?;

@@ -27,7 +27,7 @@ use log::{debug, info};
 use thiserror::Error;
 use tokio::time::timeout;
 
-use crate::crypto::prekeys::{IdentityKind, PrekeyError, generate_upload_persist};
+use crate::crypto::prekeys::{IdentityKind, PrekeyError};
 use crate::crypto::provisioning::{ProvisioningKeyPair, decrypt_envelope, proto::ProvisionMessage};
 use crate::net::{Environment as NetEnv, NetError, connect_provisioning};
 use crate::storage::{LinkStatus, SqliteStore, Store, StoreError};
@@ -105,6 +105,11 @@ pub struct LinkOutcome {
 /// The address is the value pulled from `ProvisioningEvent::ReceivedAddress`
 /// and is treated as opaque by both sides.
 pub fn build_provisioning_uri(public_key: &[u8], address: &str) -> String {
+    debug!(
+        "build_provisioning_uri: public_key_len={} address={}",
+        public_key.len(),
+        address
+    );
     use base64::Engine as _;
     let pub_b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(public_key);
     // sgnl://linkdevice?uuid=<address>&pub_key=<base64-no-pad>
@@ -254,7 +259,10 @@ pub async fn link(
 ) -> Result<LinkOutcome, LinkError> {
     debug!("link: state_dir={} device_name={}", state_dir.display(), device_name);
 
-    let store = SqliteStore::open(state_dir).await?;
+    // Match Client::open's convention: state_dir is a directory; the
+    // SQLite database lives at state_dir/store.db.
+    let db_path = state_dir.join("store.db");
+    let store = SqliteStore::open(&db_path).await?;
 
     // Half-linked recovery: skip the protocol exchange entirely and pick
     // up at whichever sub-step did not finish last time. `load_identity`
@@ -294,15 +302,24 @@ async fn finalize_after_persist(
     account_number: &str,
     device_name: &str,
 ) -> Result<LinkOutcome, LinkError> {
+    debug!(
+        "finalize_after_persist: account_number={} device_name={}",
+        account_number, device_name
+    );
     let identity = store.load_identity().await?;
-    let registration_id = identity.registration_id;
+    let aci_registration_id = identity.registration_id;
+    debug!(
+        "finalize_after_persist: loaded identity link_status={:?} registration_id={} device_id={}",
+        identity.link_status, aci_registration_id, identity.device_id
+    );
 
-    // Device-completion only runs once per provisioning_code; check
-    // whether we already have a password (proxy for "device-completion
-    // succeeded previously") before calling.
+    // Skip the link PUT if we already completed it on a prior attempt
+    // (password is the proxy: it's only persisted on /v1/devices/link
+    // success). The prekey upload step is idempotent and re-runs to
+    // top up if the prior attempt failed there.
     let device_id = match store.get_password().await? {
         Some(_) => {
-            debug!("finalize_after_persist: password already set, skipping device-completion");
+            debug!("finalize_after_persist: password already set, skipping device-link PUT");
             identity.device_id
         }
         None => {
@@ -310,16 +327,76 @@ async fn finalize_after_persist(
                 .get_provisioning_code()
                 .await?
                 .ok_or(LinkError::MissingField("provisioningCode (after persist)"))?;
-            let assigned =
-                crate::api::complete_device_registration(store, &code, device_name, account_number, registration_id)
-                    .await
-                    .map_err(|e| LinkError::DeviceCompletion(e.to_string()))?;
+            if store.get_pni_identity_keypair().await?.is_none() {
+                return Err(LinkError::MissingField(
+                    "pni_identity_keypair (required by /v1/devices/link)",
+                ));
+            }
+            // PNI registration id: signal-cli reuses the ACI registration
+            // id for both during the link PUT.  We mirror that.
+            let pni_registration_id = aci_registration_id;
+
+            let mut rng = rand::rng();
+            // ACI and PNI prekey pools live in disjoint server-side
+            // identity scopes, but our local libsignal-protocol stores
+            // are keyed by prekey id alone (no identity discriminator
+            // on the trait). To prevent ACI/PNI overwriting each other
+            // locally, allocate from disjoint id ranges: ACI uses
+            // 1..(2^23-1), PNI uses 2^23.. (libsignal's MAX_KEY_ID is
+            // 2^24-1, leaving each pool 8M ids of room).
+            const PNI_ID_OFFSET: u32 = 1 << 23;
+            let aci_batch = crate::crypto::prekeys::generate_batch(&mut rng, store, IdentityKind::Aci, 1).await?;
+            let pni_batch =
+                crate::crypto::prekeys::generate_batch(&mut rng, store, IdentityKind::Pni, PNI_ID_OFFSET + 1).await?;
+
+            let aci_prekeys = crate::api::LinkPreKeys {
+                signed_record: &aci_batch.signed_record,
+                kyber_record: &aci_batch.kyber_record,
+                signed_id: aci_batch.signed_prekey_id,
+                kyber_id: aci_batch.kyber_prekey_id,
+            };
+            let pni_prekeys = crate::api::LinkPreKeys {
+                signed_record: &pni_batch.signed_record,
+                kyber_record: &pni_batch.kyber_record,
+                signed_id: pni_batch.signed_prekey_id,
+                kyber_id: pni_batch.kyber_prekey_id,
+            };
+
+            let assigned = crate::api::link_device(
+                store,
+                &code,
+                device_name,
+                account_number,
+                aci_registration_id,
+                pni_registration_id,
+                aci_prekeys,
+                pni_prekeys,
+            )
+            .await
+            .map_err(|e| LinkError::DeviceCompletion(e.to_string()))?;
             store.clear_provisioning_code().await?;
+
+            // Server now has aci+pni signed+kyber-last-resort. Persist
+            // the full batches locally so the one-time halves are
+            // available for the followup /v2/keys upload and so that
+            // libsignal-protocol's session machinery can resolve any
+            // prekey id a peer references.
+            crate::crypto::prekeys::persist_batch(store, &aci_batch).await?;
+            crate::crypto::prekeys::persist_batch(store, &pni_batch).await?;
+
             assigned
         }
     };
 
-    finish_prekey_upload(store, account_number).await?;
+    // Transition to Linked. One-time prekey upload (/v2/keys) is
+    // intentionally NOT run here: /v1/devices/link already seeded the
+    // server with our signed + kyber-last-resort prekeys for both
+    // identities (enough for PQXDH session initiation by peers), and
+    // the Phase 8 replenishment cycle in the receive loop will detect
+    // the empty one-time pool on first QueueEmpty and top it up. This
+    // avoids issuing a redundant /v2/keys PUT that would re-upload the
+    // same signed+kyber we just sent via the link PUT.
+    mark_linked(store).await?;
 
     Ok(LinkOutcome {
         account_number: account_number.to_string(),
@@ -333,6 +410,7 @@ async fn drive_provisioning_handshake(
     store: &SqliteStore,
     display_qr: impl FnOnce(&str),
 ) -> Result<LinkOutcome, LinkError> {
+    debug!("drive_provisioning_handshake: env=Production");
     let mut rng = rand::rng();
     let keypair = ProvisioningKeyPair::generate(&mut rng);
     let pubkey = keypair.public_key_bytes();
@@ -371,47 +449,44 @@ async fn drive_provisioning_handshake(
     persist_provision_message(store, &msg).await
 }
 
-/// Step 4 of [`link`]: generate prekeys, upload them, transition to
-/// `Linked`. Pulled into its own function so the half-linked-resume path
-/// can call it directly without going through the WebSocket handshake.
-async fn finish_prekey_upload(store: &SqliteStore, account_number: &str) -> Result<(), LinkError> {
-    debug!("finish_prekey_upload: account={}", account_number);
-    let mut rng = rand::rng();
-    // Initial upload: ACI keys first, then PNI keys (signal-cli does
-    // both during link). Each is its own batch with its own signing
-    // identity. Phase 8 replenishment will continue from the highest
-    // id already in the store, per identity. Both batches start at id
-    // 1 because they live in disjoint server-side pools.
-    generate_upload_persist(&mut rng, store, IdentityKind::Aci, 1).await?;
-    // PNI batch only if a PNI keypair was supplied by the primary.
-    if store.get_pni_identity_keypair().await?.is_some() {
-        generate_upload_persist(&mut rng, store, IdentityKind::Pni, 1).await?;
-    } else {
-        debug!("finish_prekey_upload: no PNI identity persisted, skipping PNI prekey upload");
-    }
-    mark_linked(store).await?;
-    info!("finish_prekey_upload: link_status -> Linked");
-    Ok(())
-}
-
 /// Pull the next typed `ProvisioningEvent` off the listener channel,
-/// converting from `ws::ListenerEvent` and applying a timeout. Maps the
-/// non-event states (`Stopped`, channel close) to typed `LinkError`s.
+/// converting from `ws::ListenerEvent` and applying a timeout.
+///
+/// **Alert handling:** Signal-Server sends `x-signal-alert` headers on
+/// the provisioning WebSocket as the very first message after the
+/// handshake (operational banners, e.g. "version X deprecated").
+/// libsignal-net's `ProvisioningEvent::try_from` rejects alerts with
+/// `UnrecognizedPath(ALERT_HEADER_NAME)` because "provisioning
+/// shouldn't have alerts" - but in practice it always does. The
+/// libsignal bridge layer just log-and-skips alerts on provisioning
+/// connections; we do the same here.
 async fn wait_for_event(
     events: &mut tokio::sync::mpsc::UnboundedReceiver<ListenerEvent>,
     label: &'static str,
     deadline: Duration,
 ) -> Result<ProvisioningEvent, LinkError> {
-    let raw = timeout(deadline, events.recv())
-        .await
-        .map_err(|_| LinkError::ProvisioningTimeout(label, deadline))?
-        .ok_or(LinkError::ProvisioningStreamClosed)?;
-    let typed =
-        ProvisioningEvent::try_from(raw).map_err(|e| LinkError::ProvisioningEventDecode(label, e.to_string()))?;
-    if let ProvisioningEvent::Stopped(cause) = &typed {
-        return Err(LinkError::ProvisioningDisconnected(format!("{cause:?}")));
+    debug!("wait_for_event: label={} deadline={:?}", label, deadline);
+    use libsignal_net::chat::ws::ListenerEvent as WsEv;
+    loop {
+        let raw = timeout(deadline, events.recv())
+            .await
+            .map_err(|_| LinkError::ProvisioningTimeout(label, deadline))?
+            .ok_or(LinkError::ProvisioningStreamClosed)?;
+        // Skip ReceivedAlerts before trying to convert - libsignal's
+        // ProvisioningEvent::try_from would error on them.
+        if let WsEv::ReceivedAlerts(alerts) = &raw {
+            if !alerts.is_empty() {
+                debug!("wait_for_event: ignoring provisioning alerts: {alerts:?}");
+            }
+            continue;
+        }
+        let typed =
+            ProvisioningEvent::try_from(raw).map_err(|e| LinkError::ProvisioningEventDecode(label, e.to_string()))?;
+        if let ProvisioningEvent::Stopped(cause) = &typed {
+            return Err(LinkError::ProvisioningDisconnected(format!("{cause:?}")));
+        }
+        return Ok(typed);
     }
-    Ok(typed)
 }
 
 /// Format an unexpected `ProvisioningEvent` for the error path.
@@ -432,6 +507,7 @@ pub fn prepare_link_session<R: rand::Rng + rand::CryptoRng>(
     rng: &mut R,
     address: &str,
 ) -> (ProvisioningKeyPair, String) {
+    debug!("prepare_link_session: address={}", address);
     let kp = ProvisioningKeyPair::generate(rng);
     let uri = build_provisioning_uri(&kp.public_key_bytes(), address);
     (kp, uri)
@@ -446,6 +522,7 @@ pub async fn finalize_link(
     keypair: &ProvisioningKeyPair,
     encrypted_envelope: &[u8],
 ) -> Result<LinkOutcome, LinkError> {
+    debug!("finalize_link: envelope_len={}", encrypted_envelope.len());
     let msg = decrypt_envelope(keypair, encrypted_envelope)?;
     persist_provision_message(store, &msg).await
 }

@@ -48,19 +48,20 @@ async fn load_identity_on_empty_store_errors_not_linked() {
 }
 
 #[tokio::test]
-async fn load_identity_on_partial_link_errors_partially_linked() {
+async fn load_identity_on_partial_link_returns_ok_with_identity_persisted_status() {
     let store = SqliteStore::open_in_memory().await.unwrap();
     let kp = fixed_identity_keypair();
     store
         .save_identity_bundle(&kp, 1, "+15555555555", 1, LinkStatus::IdentityPersisted)
         .await
         .unwrap();
-    match store.load_identity().await {
-        Err(StoreError::PartiallyLinked {
-            status: LinkStatus::IdentityPersisted,
-        }) => {}
-        other => panic!("expected PartiallyLinked, got {:?}", other),
-    }
+    let partial = store
+        .load_identity()
+        .await
+        .expect("load_identity must return Ok for partial state");
+    assert_eq!(partial.link_status, LinkStatus::IdentityPersisted);
+    assert_eq!(partial.account_number, "+15555555555");
+    assert_eq!(partial.registration_id, 1);
     store.set_link_status(LinkStatus::Linked).await.unwrap();
     let loaded = store.load_identity().await.unwrap();
     assert_eq!(loaded.link_status, LinkStatus::Linked);

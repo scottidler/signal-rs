@@ -293,6 +293,10 @@ pub async fn generate_upload_persist<R: rand::Rng + rand::CryptoRng>(
     identity_kind: IdentityKind,
     next_id: u32,
 ) -> Result<GeneratedBatch, PrekeyError> {
+    debug!(
+        "generate_upload_persist: identity_kind={:?} next_id={}",
+        identity_kind, next_id
+    );
     // 1. Generate the records in memory.
     let batch = generate_batch(rng, store, identity_kind, next_id).await?;
 
