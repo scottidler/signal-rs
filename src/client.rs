@@ -296,6 +296,12 @@ impl Client {
             match event {
                 ServerEvent::QueueEmpty => {
                     info!("run_receive_loop: server reports queue empty");
+                    // Best-effort prekey replenishment trigger - if our
+                    // remaining one-time prekey count looks low, generate
+                    // and upload a fresh batch.
+                    if let Err(e) = self.maybe_replenish_prekeys().await {
+                        warn!("run_receive_loop: prekey replenishment failed: {e}; will retry on next batch");
+                    }
                 }
                 ServerEvent::Alerts(alerts) => {
                     for a in alerts {
@@ -561,6 +567,52 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+impl Client {
+    /// Phase 8 prekey replenishment. Counts the persisted one-time
+    /// prekey rows; if below the design-doc's `PREKEY_LOW_WATERMARK`,
+    /// generates and uploads a fresh batch.
+    ///
+    /// This is the consumer trigger described in Phase 8: the receive
+    /// loop's batch-ack cycle (a `QueueEmpty` event) is the canonical
+    /// signal that we've successfully processed everything the server
+    /// had, which is a good time to ensure the next inbound peer has
+    /// keys to start a session.
+    async fn maybe_replenish_prekeys(&self) -> Result<(), ReceiveError> {
+        use crate::crypto::prekeys::{PREKEY_LOW_WATERMARK, generate_and_persist_batch, upload_batch};
+
+        let pool = self.inner.store.pool().clone();
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM prekeys")
+            .fetch_one(&pool)
+            .await
+            .map_err(StoreError::from)?;
+        let remaining = row.0 as u32;
+        debug!(
+            "maybe_replenish_prekeys: remaining={} watermark={}",
+            remaining, PREKEY_LOW_WATERMARK
+        );
+        if remaining >= PREKEY_LOW_WATERMARK {
+            return Ok(());
+        }
+
+        let next_id: (Option<i64>,) = sqlx::query_as("SELECT MAX(id) FROM prekeys")
+            .fetch_one(&pool)
+            .await
+            .map_err(StoreError::from)?;
+        let next_id = next_id.0.map(|v| v as u32).unwrap_or(0).saturating_add(1);
+
+        let mut rng = rand::rng();
+        let batch = generate_and_persist_batch(&mut rng, &self.inner.store, next_id)
+            .await
+            .map_err(|e| ReceiveError::Stopped(format!("generate_and_persist_batch: {e}")))?;
+        upload_batch(&self.inner.store, &batch)
+            .await
+            .map_err(|e| ReceiveError::Stopped(format!("upload_batch: {e}")))?;
+
+        info!("maybe_replenish_prekeys: uploaded batch starting at id={}", next_id);
+        Ok(())
+    }
 }
 
 /// Build the inner Content protobuf for a Note-to-Self send: wraps the
