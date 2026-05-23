@@ -850,22 +850,15 @@ impl Client {
     /// had, which is a good time to ensure the next inbound peer has
     /// keys to start a session.
     async fn maybe_replenish_prekeys(&self) -> Result<(), ReceiveError> {
-        use crate::crypto::prekeys::{IdentityKind, PREKEY_LOW_WATERMARK, generate_upload_persist};
+        use crate::crypto::prekeys::IdentityKind;
 
+        // Per-identity replenishment, against the SERVER's authoritative
+        // count (not local SELECT COUNT). The server is the source of
+        // truth — peers consume one-time prekeys server-side, and the
+        // local store has no way to observe that consumption until the
+        // resulting message arrives. signal-cli's
+        // PreKeyHelper.refreshPreKeysIfNecessary uses the same pattern.
         let pool = self.inner.store.pool().clone();
-        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM prekeys")
-            .fetch_one(&pool)
-            .await
-            .map_err(StoreError::from)?;
-        let remaining = row.0 as u32;
-        debug!(
-            "maybe_replenish_prekeys: remaining={} watermark={}",
-            remaining, PREKEY_LOW_WATERMARK
-        );
-        if remaining >= PREKEY_LOW_WATERMARK {
-            return Ok(());
-        }
-
         let next_id: (Option<i64>,) = sqlx::query_as("SELECT MAX(id) FROM prekeys")
             .fetch_one(&pool)
             .await
@@ -873,19 +866,56 @@ impl Client {
         let next_id = next_id.0.map(|v| v as u32).unwrap_or(0).saturating_add(1);
 
         let mut rng = rand::rng();
-        // Replenish ACI keys; replenish PNI too if a PNI identity was
-        // persisted at link. Failure on either propagates and stops the
-        // batch — next QueueEmpty will retry.
-        generate_upload_persist(&mut rng, &self.inner.store, IdentityKind::Aci, next_id)
-            .await
-            .map_err(|e| ReceiveError::Stopped(format!("aci replenish: {e}")))?;
+        self.maybe_replenish_one_identity(IdentityKind::Aci, &mut rng, next_id)
+            .await?;
         if self.inner.store.get_pni_identity_keypair().await?.is_some() {
-            generate_upload_persist(&mut rng, &self.inner.store, IdentityKind::Pni, next_id)
-                .await
-                .map_err(|e| ReceiveError::Stopped(format!("pni replenish: {e}")))?;
+            self.maybe_replenish_one_identity(IdentityKind::Pni, &mut rng, next_id)
+                .await?;
         }
 
-        info!("maybe_replenish_prekeys: uploaded batch starting at id={}", next_id);
+        info!("maybe_replenish_prekeys: cycle complete (next_id={})", next_id);
+        Ok(())
+    }
+
+    /// Query the server's prekey count for one identity and replenish
+    /// if below the watermark. Refactored out so ACI and PNI can be
+    /// replenished independently without bleeding errors across
+    /// identities.
+    async fn maybe_replenish_one_identity<R: rand::Rng + rand::CryptoRng>(
+        &self,
+        identity_kind: crate::crypto::prekeys::IdentityKind,
+        rng: &mut R,
+        next_id: u32,
+    ) -> Result<(), ReceiveError> {
+        use crate::crypto::prekeys::{PREKEY_LOW_WATERMARK, generate_upload_persist};
+
+        // Pre-fetch upload credentials (also needed for the count
+        // request).  Cheap (one connection round-trip) and decoupled
+        // from the actual replenishment work, so this method doesn't
+        // hold pool connections across the network request.
+        let creds = crate::api::load_upload_credentials(&self.inner.store, identity_kind)
+            .await
+            .map_err(|e| ReceiveError::Stopped(format!("load_upload_credentials({identity_kind:?}): {e}")))?;
+
+        let counts = crate::api::get_available_prekey_count(&creds, identity_kind)
+            .await
+            .map_err(|e| ReceiveError::Stopped(format!("get_available_prekey_count({identity_kind:?}): {e}")))?;
+        debug!(
+            "maybe_replenish_one_identity: identity={:?} server_count(ec={}, pq={}) watermark={}",
+            identity_kind, counts.ec, counts.pq, PREKEY_LOW_WATERMARK
+        );
+        if counts.ec >= PREKEY_LOW_WATERMARK {
+            return Ok(());
+        }
+
+        generate_upload_persist(rng, &self.inner.store, identity_kind, next_id)
+            .await
+            .map_err(|e| ReceiveError::Stopped(format!("replenish({identity_kind:?}): {e}")))?;
+
+        info!(
+            "maybe_replenish_one_identity: refilled identity={:?} starting at id={}",
+            identity_kind, next_id
+        );
         Ok(())
     }
 }

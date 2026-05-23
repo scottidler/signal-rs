@@ -237,6 +237,60 @@ pub async fn load_upload_credentials(
     })
 }
 
+/// Server-authoritative prekey count for one identity. Returned by
+/// [`get_available_prekey_count`]; mirrors signal-cli's
+/// `OneTimePreKeyCounts(ec, kyber)` shape.
+#[derive(Debug, Clone, Copy)]
+pub struct OneTimePreKeyCounts {
+    pub ec: u32,
+    pub pq: u32,
+}
+
+/// JSON response shape for `GET /v2/keys/?identity={kind}`. Signal-Server
+/// returns `{"count": N, "pqCount": M}`. Field names verified against
+/// signal-cli's `OneTimePreKeyCounts` deserialize path.
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct PreKeyCountResponse {
+    count: u32,
+    #[serde(default)]
+    pq_count: u32,
+}
+
+/// Read the server's authoritative one-time-prekey count for the given
+/// identity. The replenishment watermark in Phase 8 should compare
+/// against this value, not the local SQLite row count - peers consume
+/// prekeys on the server side, and the local store has no way to
+/// observe that consumption until the resulting message arrives.
+pub async fn get_available_prekey_count(
+    creds: &UploadCredentials,
+    identity_kind: IdentityKind,
+) -> Result<OneTimePreKeyCounts, ApiError> {
+    let url = format!("{CHAT_BASE_URL}/v2/keys/?identity={}", identity_kind.as_query_param());
+    let user = format!("{}.{}", creds.service_id, creds.device_id);
+    let auth_header = basic_auth_header(&user, &creds.password);
+
+    debug!("get_available_prekey_count: identity={:?} url={}", identity_kind, url);
+
+    let client = http_client()?;
+    let resp = client.get(&url).header(AUTHORIZATION, auth_header).send().await?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ApiError::Server {
+            status: status.as_u16(),
+            body,
+        });
+    }
+
+    let parsed: PreKeyCountResponse = resp.json().await?;
+    Ok(OneTimePreKeyCounts {
+        ec: parsed.count,
+        pq: parsed.pq_count,
+    })
+}
+
 /// Upload a generated prekey batch under the given identity (ACI or
 /// PNI). Issues `PUT /v2/keys/?identity={kind}` with HTTP Basic auth.
 /// **No store access** — takes pre-fetched [`UploadCredentials`] so
