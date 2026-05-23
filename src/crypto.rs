@@ -6,6 +6,8 @@
 //! that arrive over the provisioning WebSocket. Reference:
 //! signal-service-android's ProvisioningCipher.java.
 
+pub mod prekeys;
 pub mod provisioning;
 
+pub use prekeys::{GeneratedBatch, PrekeyError, generate_and_persist_batch, upload_batch};
 pub use provisioning::{ProvisioningCipherError, ProvisioningKeyPair, decrypt_envelope, proto};
