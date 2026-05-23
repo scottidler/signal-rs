@@ -97,12 +97,47 @@ async fn open_succeeds_on_linked_state_dir_and_exposes_account_number() {
 }
 
 #[tokio::test]
-async fn send_to_non_note_to_self_target_returns_target_unsupported() {
+async fn send_to_pni_recipient_rejects_with_pni_send_unsupported() {
+    use crate::envelope::Recipient;
     let (tmp, _) = linked_state_dir().await;
     let client = Client::open(tmp.path()).await.unwrap();
-    match client.send("+15555550199", "hello").await {
-        Err(SendError::TargetUnsupported(t)) => assert_eq!(t, "+15555550199"),
-        other => panic!("expected TargetUnsupported, got {:?}", other),
+    let pni_target = Recipient::Pni("cccccccc-cccc-cccc-cccc-cccccccccccc".to_string());
+    match client.send(pni_target, "hello").await {
+        Err(SendError::PniSendUnsupported) => {}
+        other => panic!("expected PniSendUnsupported, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn send_to_aci_recipient_without_profile_key_or_session_errors_with_no_profile_key() {
+    use crate::envelope::Recipient;
+    let (tmp, _) = linked_state_dir().await;
+    let client = Client::open(tmp.path()).await.unwrap();
+    // A well-formed but unknown peer ACI. No peer_profile_keys row,
+    // no session. Sealed path is impossible and unsealed fallback has
+    // nothing to encrypt against, so the call must surface
+    // NoProfileKey rather than attempt a network call.
+    let peer = Recipient::Aci("11111111-1111-1111-1111-111111111111".to_string());
+    match client.send(peer, "hi").await {
+        Err(SendError::NoProfileKey(aci)) => {
+            assert!(
+                aci.contains("11111111-1111-1111-1111-111111111111"),
+                "expected the ACI in the error, got {aci}"
+            );
+        }
+        other => panic!("expected NoProfileKey, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn send_to_aci_recipient_with_invalid_uuid_rejects_with_invalid_recipient() {
+    use crate::envelope::Recipient;
+    let (tmp, _) = linked_state_dir().await;
+    let client = Client::open(tmp.path()).await.unwrap();
+    let bad = Recipient::Aci("not-a-uuid".to_string());
+    match client.send(bad, "hi").await {
+        Err(SendError::InvalidRecipient(_)) => {}
+        other => panic!("expected InvalidRecipient, got {:?}", other),
     }
 }
 
@@ -202,7 +237,10 @@ fn decode_content_data_message_round_trips_through_build_one_to_one() {
     let ts = 1_700_000_000_123_u64;
     let plaintext = build_one_to_one_content(body, ts);
 
-    let env = decode_content(&plaintext, ACI, 1, ts).expect("DataMessage Content decodes");
+    let (env_opt, peer_pk) = decode_content(&plaintext, ACI, 1, ts);
+    let env = env_opt.expect("DataMessage Content decodes");
+    // build_one_to_one_content does not set profile_key, so we expect None.
+    assert!(peer_pk.is_none(), "no profile_key was set in the build helper");
     let PubEnvelope::DataMessage {
         source,
         source_device,
@@ -229,7 +267,9 @@ fn decode_content_sync_sent_round_trips_through_build_sync_self() {
     // SyncMessage::Sent.destination comes from the SyncMessage payload.
     // SelfSync remapping is done by process_envelope, not decode_content,
     // so here we expect Recipient::Aci(own) (the raw destination string).
-    let env = decode_content(&plaintext, ACI, 1, ts).expect("SyncMessage Content decodes");
+    let env = decode_content(&plaintext, ACI, 1, ts)
+        .0
+        .expect("SyncMessage Content decodes");
     let PubEnvelope::SyncMessage(PubSyncMessage::Sent {
         destination,
         timestamp,
@@ -259,7 +299,7 @@ fn decode_content_typing_message_surfaces_typing_variant() {
         ..Default::default()
     };
     let plaintext = content.encode_to_vec();
-    let env = decode_content(&plaintext, ACI, 1, 0).expect("Typing surfaces");
+    let env = decode_content(&plaintext, ACI, 1, 0).0.expect("Typing surfaces");
     let PubEnvelope::Typing { started, timestamp, .. } = env else {
         panic!("expected Envelope::Typing");
     };
@@ -279,7 +319,7 @@ fn decode_content_receipt_message_surfaces_receipt_variant_with_kind() {
         ..Default::default()
     };
     let plaintext = content.encode_to_vec();
-    let env = decode_content(&plaintext, ACI, 1, 0).expect("Receipt surfaces");
+    let env = decode_content(&plaintext, ACI, 1, 0).0.expect("Receipt surfaces");
     let PubEnvelope::Receipt {
         receipt_kind,
         timestamps,
@@ -308,7 +348,9 @@ fn decode_content_edit_message_surfaces_edit_variant() {
         ..Default::default()
     };
     let plaintext = content.encode_to_vec();
-    let env = decode_content(&plaintext, ACI, 1, 1_800_000_000).expect("Edit surfaces");
+    let env = decode_content(&plaintext, ACI, 1, 1_800_000_000)
+        .0
+        .expect("Edit surfaces");
     let PubEnvelope::Edit {
         target_sent_timestamp,
         body,
@@ -332,7 +374,7 @@ fn decode_content_call_message_surfaces_call_variant_with_raw_bytes() {
         ..Default::default()
     };
     let plaintext = content.encode_to_vec();
-    let env = decode_content(&plaintext, ACI, 1, 0).expect("Call surfaces");
+    let env = decode_content(&plaintext, ACI, 1, 0).0.expect("Call surfaces");
     assert!(matches!(env, PubEnvelope::Call { .. }));
 }
 
@@ -353,7 +395,9 @@ fn decode_content_sync_read_surfaces_sync_read_variant() {
         ..Default::default()
     };
     let plaintext = content.encode_to_vec();
-    let env = decode_content(&plaintext, ACI, 1, 0).expect("SyncMessage::Read surfaces");
+    let env = decode_content(&plaintext, ACI, 1, 0)
+        .0
+        .expect("SyncMessage::Read surfaces");
     let PubEnvelope::SyncMessage(PubSyncMessage::Read { reads }) = env else {
         panic!("expected Envelope::SyncMessage(Read)");
     };
@@ -363,18 +407,58 @@ fn decode_content_sync_read_surfaces_sync_read_variant() {
 }
 
 #[test]
+fn decode_content_surfaces_peer_profile_key_from_data_message() {
+    // An inbound peer DataMessage with profile_key must surface that
+    // key as the second element of decode_content's return tuple so
+    // the caller can persist it for the sealed-sender outbound path.
+    use prost::Message as _;
+    let pk = vec![7u8; 32];
+    let dm = proto::DataMessage {
+        body: Some("hi with key".to_string()),
+        timestamp: Some(1_800_000_000),
+        profile_key: Some(pk.clone()),
+        ..Default::default()
+    };
+    let content = proto::Content {
+        content: Some(proto::content::Content::DataMessage(dm)),
+        ..Default::default()
+    };
+    let plaintext = content.encode_to_vec();
+    let (env, peer_pk) = decode_content(&plaintext, ACI, 1, 1_800_000_000);
+    assert!(env.is_some(), "DataMessage decodes");
+    assert_eq!(peer_pk, Some(pk));
+}
+
+#[test]
+fn decode_content_does_not_surface_profile_key_from_sync_sent() {
+    // SyncMessage::Sent.message.profile_key is OUR own key (we sent
+    // the message from another device). decode_content must not
+    // surface it as a peer key, or it would clobber the local
+    // peer_profile_keys row for our own ACI.
+    let body = "self-sync with our key";
+    let own = "+15555550100";
+    let ts = 1_900_000_000_u64;
+    let plaintext = build_sync_self_content(body, own, ts);
+    let (_, peer_pk) = decode_content(&plaintext, ACI, 1, ts);
+    assert!(
+        peer_pk.is_none(),
+        "SyncMessage::Sent must not surface a peer profile_key"
+    );
+}
+
+#[test]
 fn decode_content_returns_none_for_empty_content() {
     // An empty Content (no oneof set, no `read` payload) must not
     // synthesize a DataMessage/SyncMessage from nothing.
     use prost::Message as _;
     let plaintext = proto::Content::default().encode_to_vec();
-    assert!(decode_content(&plaintext, ACI, 1, 1_700_000_000).is_none());
+    assert!(decode_content(&plaintext, ACI, 1, 1_700_000_000).0.is_none());
 }
 
 #[test]
 fn decode_content_returns_none_on_undecodable_bytes() {
     let plaintext = b"this is not a valid protobuf";
-    assert!(decode_content(plaintext, ACI, 1, 0).is_none());
+    assert!(decode_content(plaintext, ACI, 1, 0).0.is_none());
 }
 
 #[test]

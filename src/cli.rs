@@ -54,11 +54,14 @@ pub enum Command {
         name: String,
     },
 
-    /// Send a 1:1 text message. Pass your own E.164 to fan out a
-    /// Note-to-Self.
+    /// Send a 1:1 text message. `--to self` fans out a Note-to-Self
+    /// to the user's other linked devices; `--to aci:UUID` sends a
+    /// sealed-sender peer message (falling back to unsealed with a
+    /// warning if we have no profile key on file for that peer).
     Send {
-        /// Recipient E.164 number (e.g. +15555550100).
-        target: String,
+        /// Recipient. Accepted forms: `self`, `aci:<uuid>`.
+        #[arg(long)]
+        to: String,
         /// Message body. Wrap in quotes if it contains spaces.
         message: String,
     },

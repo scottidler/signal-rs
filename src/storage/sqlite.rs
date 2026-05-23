@@ -27,6 +27,8 @@ const IDENTITY_KEY_PNI: &str = "pni";
 const IDENTITY_KEY_ACI: &str = "aci";
 const IDENTITY_KEY_PROFILE_KEY: &str = "profile_key";
 const IDENTITY_KEY_PROVISIONING_CODE: &str = "provisioning_code";
+const IDENTITY_KEY_SENDER_CERTIFICATE: &str = "sender_certificate";
+const IDENTITY_KEY_SENDER_CERTIFICATE_EXPIRY_MS: &str = "sender_certificate_expiry_ms";
 
 // SQL strings hoisted to module-level constants so the pool-backed
 // `IdentityScopedStore` and the transaction-backed `Tx*Store` use
@@ -185,6 +187,72 @@ impl SqliteStore {
     pub async fn get_profile_key(&self) -> Result<Option<Vec<u8>>, StoreError> {
         debug!("get_profile_key:");
         self.get_identity_value(IDENTITY_KEY_PROFILE_KEY).await
+    }
+
+    /// Persist a peer's profile key, keyed by their ACI string. Called
+    /// from the inbound receive path whenever a `DataMessage.profile_key`
+    /// is present. The sealed-sender outbound path looks this up to
+    /// derive the recipient's `Unidentified-Access-Key`.
+    ///
+    /// `INSERT OR REPLACE` so successive inbound messages from the same
+    /// peer overwrite the latest (peers may rotate their profile key).
+    pub async fn set_peer_profile_key(&self, aci: &str, profile_key: &[u8]) -> Result<(), StoreError> {
+        debug!("set_peer_profile_key: aci={} len={}", aci, profile_key.len());
+        let now_ms = now_millis_i64();
+        sqlx::query("INSERT OR REPLACE INTO peer_profile_keys (aci, profile_key, updated_ms) VALUES (?, ?, ?)")
+            .bind(aci)
+            .bind(profile_key)
+            .bind(now_ms)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Load a peer's profile key, if persisted.
+    pub async fn get_peer_profile_key(&self, aci: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        debug!("get_peer_profile_key: aci={}", aci);
+        let row = sqlx::query("SELECT profile_key FROM peer_profile_keys WHERE aci = ?")
+            .bind(aci)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<Vec<u8>, _>("profile_key")))
+    }
+
+    /// Persist the encoded sender certificate (raw `SenderCertificate`
+    /// bytes from `SenderCertificate::serialized()`) and its expiry in
+    /// epoch milliseconds. Stored as two rows in the `identity` singleton
+    /// table because the certificate is per-account, not per-peer.
+    pub async fn set_sender_certificate(&self, encoded: &[u8], expiry_ms: u64) -> Result<(), StoreError> {
+        debug!(
+            "set_sender_certificate: encoded_len={} expiry_ms={}",
+            encoded.len(),
+            expiry_ms
+        );
+        self.put_identity_value(IDENTITY_KEY_SENDER_CERTIFICATE, encoded)
+            .await?;
+        self.put_identity_value(IDENTITY_KEY_SENDER_CERTIFICATE_EXPIRY_MS, &expiry_ms.to_be_bytes())
+            .await?;
+        Ok(())
+    }
+
+    /// Load the cached sender certificate bytes and expiry. Returns
+    /// `None` if either row is missing.
+    pub async fn get_sender_certificate(&self) -> Result<Option<(Vec<u8>, u64)>, StoreError> {
+        debug!("get_sender_certificate:");
+        let Some(encoded) = self.get_identity_value(IDENTITY_KEY_SENDER_CERTIFICATE).await? else {
+            return Ok(None);
+        };
+        let Some(expiry_bytes) = self
+            .get_identity_value(IDENTITY_KEY_SENDER_CERTIFICATE_EXPIRY_MS)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let arr: [u8; 8] = expiry_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Corrupt("sender_certificate_expiry_ms length".into()))?;
+        Ok(Some((encoded, u64::from_be_bytes(arr))))
     }
 
     /// Persist the one-shot provisioning code from the ProvisionMessage.
@@ -741,6 +809,16 @@ impl KyberPreKeyStore for IdentityScopedStore {
             .map_err(map_sqlx)?;
         Ok(())
     }
+}
+
+/// Current epoch milliseconds as i64 (SQLite INTEGER fits in i64).
+/// Returns 0 if the system clock predates UNIX_EPOCH (impossible in
+/// practice, but the conversion is fallible).
+fn now_millis_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -10,8 +10,7 @@ use std::time::Duration;
 use libsignal_net::chat::server_requests::ServerEvent;
 use libsignal_net::chat::{AuthenticatedChatHeaders, ChatConnection, LanguageList, ReceiveStories};
 use libsignal_protocol::{
-    Aci, CiphertextMessage, CiphertextMessageType, DeviceId, PreKeySignalMessage, ProtocolAddress, SessionStore,
-    SignalMessage,
+    Aci, CiphertextMessage, CiphertextMessageType, DeviceId, PreKeySignalMessage, ProtocolAddress, SignalMessage,
 };
 use log::{debug, info, trace, warn};
 use prost::Message as _;
@@ -22,6 +21,10 @@ use crate::crypto::provisioning::proto;
 use crate::envelope::Envelope;
 use crate::net::{self, Environment as NetEnv, NetError};
 use crate::storage::{Identity, LinkStatus, SqliteStore, Store, StoreError};
+
+mod send;
+#[cfg(test)]
+pub(crate) use send::{build_one_to_one_content, build_sync_self_content};
 
 const RECEIVE_CHANNEL_CAPACITY: usize = 256;
 
@@ -81,19 +84,27 @@ pub enum SendError {
     #[error("libsignal-net connect error: {0}")]
     Net(#[from] NetError),
 
+    #[error("api error: {0}")]
+    Api(#[from] crate::api::ApiError),
+
     #[error("send failed: {0}")]
     Server(String),
 
     #[error("missing credential in store: {0}")]
     MissingCredential(&'static str),
 
+    #[error("invalid recipient: {0}")]
+    InvalidRecipient(String),
+
     #[error(
-        "non-Note-to-Self sends require E.164 -> ACI resolution via the \
-         attested CDSI service, which is out of scope for v0.1. Sending to \
-         the account's own number (Note-to-Self via send_sync_message) is \
-         supported. target={0}"
+        "no profile key on file for peer ACI {0}; receive at least one \
+         message from this peer first (or wait for SyncMessage::Contacts \
+         backfill, which is post-v0.1)"
     )]
-    TargetUnsupported(String),
+    NoProfileKey(String),
+
+    #[error("PNI-addressed sends are unsupported in v0.1")]
+    PniSendUnsupported,
 }
 
 /// The Signal client. One per state directory. Owns the SQLite pool
@@ -175,222 +186,6 @@ impl Client {
         self.inner.store.clone()
     }
 
-    /// Send a 1:1 text message. `target` is an E.164 number. Pass the
-    /// account's own number to fan out a Note-to-Self.
-    ///
-    /// v0.1's CLI surface accepts E.164 because the operator already
-    /// knows the number; resolving it to an ACI requires the attested
-    /// CDSI service (libsignal-net::cdsi, SGX-attested), which is out
-    /// of v0.1 scope. Callers that already know the recipient's ACI
-    /// and access-key should use [`Client::send_to_aci`] directly.
-    ///
-    /// Behavior:
-    /// - target == own E.164 number -> Note-to-Self via send_sync_message
-    /// - target != own E.164 number -> SendError::TargetUnsupported
-    pub async fn send(&self, target: &str, body: &str) -> Result<(), SendError> {
-        debug!("Client::send: target={} body_len={}", target, body.len());
-
-        if !self.is_note_to_self(target) {
-            return Err(SendError::TargetUnsupported(target.to_string()));
-        }
-        self.send_note_to_self(body).await
-    }
-
-    /// Send a 1:1 text message to a known ACI. The caller must supply
-    /// the recipient's `access_key` (16 bytes, derived from their
-    /// profile key) so the unauthenticated prekey-bundle fetch can
-    /// authorize. For Note-to-Self use [`Client::send`] with the
-    /// account's own E.164 number, or [`Client::send_note_to_self`]
-    /// directly; that path uses `send_sync_message` and does not need
-    /// an access key.
-    ///
-    /// The flow:
-    /// 1. If no session exists for `target`, open an unauthenticated
-    ///    chat WebSocket and fetch the prekey bundle via
-    ///    `UnauthenticatedChatApi::get_pre_keys`. Process each device's
-    ///    bundle into a fresh session via `process_prekey_bundle`.
-    /// 2. Encrypt the message via libsignal-protocol's `message_encrypt`.
-    /// 3. Open an authenticated chat WebSocket and dispatch via
-    ///    `AuthenticatedChatApi::send_message`.
-    ///
-    /// Atomicity: encrypt + session-state persist + outbound-record
-    /// happen inside one `sqlx::Transaction` (mirrors the receive
-    /// pipeline's contract).
-    pub async fn send_to_aci(
-        &self,
-        target: Aci,
-        body: &str,
-        access_key: [u8; zkgroup::ACCESS_KEY_LEN],
-    ) -> Result<(), SendError> {
-        use libsignal_net_chat::api::keys::{DeviceSpecifier, UnauthenticatedChatApi};
-        use libsignal_net_chat::api::messages::{AuthenticatedChatApi, SingleOutboundUnsealedMessage};
-        use libsignal_net_chat::api::{Auth, Unauth, UserBasedAuthorization};
-        use libsignal_protocol::ServiceId;
-
-        debug!(
-            "Client::send_to_aci: target={} body_len={}",
-            target.service_id_string(),
-            body.len()
-        );
-
-        let aci_string = self
-            .inner
-            .store
-            .get_aci()
-            .await?
-            .ok_or(SendError::MissingCredential("aci"))?;
-        let local_device_id = device_id_from_u32(self.inner.identity.device_id)
-            .map_err(|e| SendError::Server(format!("device_id: {e}")))?;
-        let local_address = ProtocolAddress::new(aci_string.clone(), local_device_id);
-
-        // 1. Check whether we already hold any session for the target's
-        //    ACI. If we do, skip the unauthenticated `get_pre_keys`
-        //    fetch entirely — fetching consumes a one-time prekey from
-        //    the recipient's server-side pool, so repeatedly sending to
-        //    a known recipient would burn through their prekeys.
-        //    Per the design doc: "If no session exists for the target,
-        //    fetch their prekey bundle".
-        let target_service_id_string = target.service_id_string();
-        let known_device_ids = self
-            .inner
-            .store
-            .session_device_ids_for_service_id(&target_service_id_string)
-            .await?;
-
-        let bundles_to_process: Option<Vec<libsignal_protocol::PreKeyBundle>> = if known_device_ids.is_empty() {
-            // Cold path: no sessions yet. Fetch all device bundles.
-            let (unauth_chat, unauth_events) = net::connect_chat_unauthenticated(NetEnv::Production)
-                .await
-                .map_err(|e| SendError::Server(format!("open unauth chat: {e}")))?;
-            drop(unauth_events);
-            let unauth = Unauth(unauth_chat);
-            let (_, bundles) = unauth
-                .get_pre_keys(
-                    UserBasedAuthorization::AccessKey(access_key),
-                    ServiceId::from(target),
-                    DeviceSpecifier::AllDevices,
-                )
-                .await
-                .map_err(|e| SendError::Server(format!("get_pre_keys: {e:?}")))?;
-            unauth.0.disconnect().await;
-            if bundles.is_empty() {
-                return Err(SendError::Server("get_pre_keys returned no device bundles".to_string()));
-            }
-            Some(bundles)
-        } else {
-            None
-        };
-
-        // 2. Encrypt one ciphertext per recipient device, threading
-        //    session-state writes through one transaction. TxStore owns
-        //    the transaction; sub-stores share it via Arc<Mutex<_>>.
-        let pool = self.inner.store.pool().clone();
-        let tx = pool.begin().await.map_err(StoreError::from)?;
-        let tx_store = crate::storage::tx::TxStore::new(tx);
-        let mut session = tx_store.session_store();
-        // Send paths operate AS our ACI identity.
-        let mut identity = tx_store.identity_store(crate::crypto::prekeys::IdentityKind::Aci);
-        let mut outbound: Vec<SingleOutboundUnsealedMessage<CiphertextMessage>> = Vec::new();
-
-        if let Some(bundles) = bundles_to_process {
-            // Cold path: process each fetched bundle into a session, then
-            // encrypt for that device.
-            for bundle in bundles.iter() {
-                let device_id = bundle.device_id().map_err(SendError::Signal)?;
-                let registration_id = bundle.registration_id().map_err(SendError::Signal)?;
-                let remote_address = ProtocolAddress::new(target_service_id_string.clone(), device_id);
-
-                libsignal_protocol::process_prekey_bundle(
-                    &remote_address,
-                    &local_address,
-                    &mut session,
-                    &mut identity,
-                    bundle,
-                    std::time::SystemTime::now(),
-                    &mut rand::rng(),
-                )
-                .await?;
-
-                let content_bytes = build_one_to_one_content(body, now_millis());
-                let ciphertext = libsignal_protocol::message_encrypt(
-                    &content_bytes,
-                    &remote_address,
-                    &local_address,
-                    &mut session,
-                    &mut identity,
-                    std::time::SystemTime::now(),
-                    &mut rand::rng(),
-                )
-                .await?;
-                outbound.push(SingleOutboundUnsealedMessage {
-                    device_id,
-                    registration_id,
-                    contents: ciphertext,
-                });
-            }
-        } else {
-            // Hot path: encrypt against existing sessions, no bundle
-            // fetch. If the recipient added a new device since we last
-            // talked, send_message will return MismatchedDevices and the
-            // caller can retry with a fresh fetch.
-            for device_id_u32 in &known_device_ids {
-                let device_id =
-                    device_id_from_u32(*device_id_u32).map_err(|e| SendError::Server(format!("device_id: {e}")))?;
-                let remote_address = ProtocolAddress::new(target_service_id_string.clone(), device_id);
-                let session_record = SessionStore::load_session(&session, &remote_address)
-                    .await?
-                    .ok_or_else(|| SendError::Server(format!("session row for device {device_id} disappeared")))?;
-                let registration_id = session_record.remote_registration_id().map_err(SendError::Signal)?;
-
-                let content_bytes = build_one_to_one_content(body, now_millis());
-                let ciphertext = libsignal_protocol::message_encrypt(
-                    &content_bytes,
-                    &remote_address,
-                    &local_address,
-                    &mut session,
-                    &mut identity,
-                    std::time::SystemTime::now(),
-                    &mut rand::rng(),
-                )
-                .await?;
-                outbound.push(SingleOutboundUnsealedMessage {
-                    device_id,
-                    registration_id,
-                    contents: ciphertext,
-                });
-            }
-        }
-        drop(session);
-        drop(identity);
-        tx_store.commit().await.map_err(StoreError::from)?;
-
-        // 3. Dispatch over the authenticated chat WebSocket.
-        let (auth_chat, auth_events) = self
-            .open_authenticated_chat()
-            .await
-            .map_err(|e| SendError::Server(format!("open auth chat: {e}")))?;
-        drop(auth_events);
-        let auth = Auth(auth_chat);
-        auth.send_message(
-            ServiceId::from(target),
-            libsignal_protocol::Timestamp::from_epoch_millis(now_millis()),
-            &outbound,
-            false, // online_only
-            true,  // urgent
-        )
-        .await
-        .map_err(|e| SendError::Server(format!("send_message: {e:?}")))?;
-
-        info!("send_to_aci: dispatched to {} devices", outbound.len());
-        Ok(())
-    }
-
-    fn is_note_to_self(&self, target: &str) -> bool {
-        let result = target == self.inner.identity.account_number;
-        trace!("is_note_to_self: target={} result={}", target, result);
-        result
-    }
-
     /// Fetch and decrypt a CDN-hosted attachment referenced by an
     /// [`AttachmentPointer`] (pulled off an inbound `Envelope::DataMessage`
     /// or `SyncMessage::Sent`). Verifies HMAC + SHA-256 digest before
@@ -402,210 +197,6 @@ impl Client {
         dest: &Path,
     ) -> Result<(), crate::attachment::AttachmentError> {
         crate::attachment::download_attachment(pointer, dest).await
-    }
-
-    /// Encrypt a Note-to-Self transcript to each of the user's OTHER
-    /// linked devices and dispatch via `send_sync_message`. The chat
-    /// server fans the encrypted blobs to those devices; the user's
-    /// other devices decode and surface them as `SyncMessage::Sent`.
-    ///
-    /// Routing: Signal's sync-message contract is "encrypt the same
-    /// transcript once per other-device, addressed `own_aci.device_id`".
-    /// We must NOT include our own device_id in the contents — the chat
-    /// server rejects that.
-    ///
-    /// Device discovery: hot path uses persisted sessions under the
-    /// own-ACI prefix (filtered for !=self). If no sessions exist (cold
-    /// path on first Note-to-Self), we fetch ALL the user's device
-    /// bundles via `UnauthenticatedChatApi::get_pre_keys(own_aci,
-    /// AllDevices)`, authorized via the access-key derived from our
-    /// own profile-key. This matches signal-cli's behavior and ensures
-    /// we don't miss other secondary devices we haven't talked to yet.
-    ///
-    /// Atomicity: encrypt + session-state persist run inside one
-    /// `sqlx::Transaction` via TxStore, matching the receive-side
-    /// contract.
-    async fn send_note_to_self(&self, body: &str) -> Result<(), SendError> {
-        debug!("send_note_to_self: body_len={}", body.len());
-        use libsignal_net_chat::api::keys::{DeviceSpecifier, UnauthenticatedChatApi};
-        use libsignal_net_chat::api::messages::{AuthenticatedChatApi, SingleOutboundUnsealedMessage};
-        use libsignal_net_chat::api::{Auth, Unauth, UserBasedAuthorization};
-        use libsignal_protocol::ServiceId;
-
-        let aci_string = self
-            .inner
-            .store
-            .get_aci()
-            .await?
-            .ok_or(SendError::MissingCredential("aci"))?;
-        let own_aci =
-            Aci::parse_from_service_id_string(&aci_string).ok_or(SendError::MissingCredential("aci-parse"))?;
-        let local_device_id = device_id_from_u32(self.inner.identity.device_id)
-            .map_err(|e| SendError::Server(format!("device_id: {e}")))?;
-        let local_device_id_u32 = self.inner.identity.device_id;
-        let local_address = ProtocolAddress::new(aci_string.clone(), local_device_id);
-
-        // Hot path: any persisted other-device sessions for own_aci.
-        let known_other_devices: Vec<u32> = self
-            .inner
-            .store
-            .session_device_ids_for_service_id(&aci_string)
-            .await?
-            .into_iter()
-            .filter(|id| *id != local_device_id_u32)
-            .collect();
-
-        // Cold path: fetch bundles for all of our own devices via the
-        // authenticated-by-access-key endpoint and process them.
-        let bundles_to_process: Option<Vec<libsignal_protocol::PreKeyBundle>> = if known_other_devices.is_empty() {
-            let profile_key = self
-                .inner
-                .store
-                .get_profile_key()
-                .await?
-                .ok_or(SendError::MissingCredential("profile_key"))?;
-            let pk_bytes: [u8; zkgroup::PROFILE_KEY_LEN] = profile_key
-                .as_slice()
-                .try_into()
-                .map_err(|_| SendError::Server(format!("profile_key length {}", profile_key.len())))?;
-            let access_key = zkgroup::profiles::ProfileKey::create(pk_bytes).derive_access_key();
-
-            let (unauth_chat, unauth_events) = net::connect_chat_unauthenticated(NetEnv::Production)
-                .await
-                .map_err(|e| SendError::Server(format!("open unauth chat: {e}")))?;
-            drop(unauth_events);
-            let unauth = Unauth(unauth_chat);
-            let (_, bundles) = unauth
-                .get_pre_keys(
-                    UserBasedAuthorization::AccessKey(access_key),
-                    ServiceId::from(own_aci),
-                    DeviceSpecifier::AllDevices,
-                )
-                .await
-                .map_err(|e| SendError::Server(format!("get_pre_keys(self,AllDevices): {e:?}")))?;
-            unauth.0.disconnect().await;
-
-            // Filter out our own device_id - the server includes us in
-            // AllDevices, but we must NOT encrypt to self.
-            let bundles: Vec<libsignal_protocol::PreKeyBundle> = bundles
-                .into_iter()
-                .filter(|b| match b.device_id() {
-                    Ok(d) => u32::from(d) != local_device_id_u32,
-                    Err(_) => false,
-                })
-                .collect();
-            if bundles.is_empty() {
-                info!("send_note_to_self: no other devices to sync to (we are the only device); no-op");
-                return Ok(());
-            }
-            Some(bundles)
-        } else {
-            None
-        };
-
-        let content_bytes = build_sync_self_content(body, &aci_string, now_millis());
-
-        // Encrypt one ciphertext per other-device inside a single
-        // transaction so session-state writes commit or roll back as a
-        // unit (atomicity contract from Phase 6).
-        let pool = self.inner.store.pool().clone();
-        let tx = pool.begin().await.map_err(StoreError::from)?;
-        let tx_store = crate::storage::tx::TxStore::new(tx);
-        let mut session = tx_store.session_store();
-        // Send paths operate AS our ACI identity.
-        let mut identity = tx_store.identity_store(crate::crypto::prekeys::IdentityKind::Aci);
-        let mut outbound: Vec<SingleOutboundUnsealedMessage<CiphertextMessage>> = Vec::new();
-
-        if let Some(bundles) = bundles_to_process {
-            // Cold path: process each bundle into a session, then
-            // encrypt for that device.
-            for bundle in bundles.iter() {
-                let device_id = bundle.device_id().map_err(SendError::Signal)?;
-                let registration_id = bundle.registration_id().map_err(SendError::Signal)?;
-                let remote_address = ProtocolAddress::new(aci_string.clone(), device_id);
-
-                libsignal_protocol::process_prekey_bundle(
-                    &remote_address,
-                    &local_address,
-                    &mut session,
-                    &mut identity,
-                    bundle,
-                    std::time::SystemTime::now(),
-                    &mut rand::rng(),
-                )
-                .await?;
-
-                let ciphertext = libsignal_protocol::message_encrypt(
-                    &content_bytes,
-                    &remote_address,
-                    &local_address,
-                    &mut session,
-                    &mut identity,
-                    std::time::SystemTime::now(),
-                    &mut rand::rng(),
-                )
-                .await?;
-                outbound.push(SingleOutboundUnsealedMessage {
-                    device_id,
-                    registration_id,
-                    contents: ciphertext,
-                });
-            }
-        } else {
-            // Hot path: encrypt against existing sessions.
-            for device_id_u32 in &known_other_devices {
-                let device_id =
-                    device_id_from_u32(*device_id_u32).map_err(|e| SendError::Server(format!("device_id: {e}")))?;
-                let remote_address = ProtocolAddress::new(aci_string.clone(), device_id);
-
-                let ciphertext = libsignal_protocol::message_encrypt(
-                    &content_bytes,
-                    &remote_address,
-                    &local_address,
-                    &mut session,
-                    &mut identity,
-                    std::time::SystemTime::now(),
-                    &mut rand::rng(),
-                )
-                .await?;
-
-                let registration_id = SessionStore::load_session(&session, &remote_address)
-                    .await?
-                    .and_then(|r| r.remote_registration_id().ok())
-                    .unwrap_or(self.inner.identity.registration_id);
-
-                outbound.push(SingleOutboundUnsealedMessage {
-                    device_id,
-                    registration_id,
-                    contents: ciphertext,
-                });
-            }
-        }
-
-        drop(session);
-        drop(identity);
-        tx_store.commit().await.map_err(StoreError::from)?;
-
-        let (auth_chat, events) = self
-            .open_authenticated_chat()
-            .await
-            .map_err(|e| SendError::Server(format!("open auth chat: {e}")))?;
-        drop(events); // Receive-side listener channel is not used by send.
-        let api = Auth(auth_chat);
-        api.send_sync_message(
-            libsignal_protocol::Timestamp::from_epoch_millis(now_millis()),
-            &outbound,
-            true, // urgent
-        )
-        .await
-        .map_err(|e| SendError::Server(format!("send_sync_message: {e:?}")))?;
-
-        info!(
-            "send_note_to_self: dispatched body_len={} to {} other device(s)",
-            body.len(),
-            outbound.len()
-        );
-        Ok(())
     }
 
     /// Run the receive loop. Opens an authenticated chat WebSocket with
@@ -881,7 +472,20 @@ impl Client {
 
         let timestamp = wire.client_timestamp.unwrap_or(0);
         let source_device: u32 = remote_address.device_id().into();
-        let mut decoded = decode_content(&plaintext, &source_service_id, source_device, timestamp);
+        let (mut decoded, peer_profile_key) = decode_content(&plaintext, &source_service_id, source_device, timestamp);
+
+        // Persist any peer profile_key carried inline on the inbound
+        // DataMessage. The outbound sealed-sender path consults this
+        // table to derive the recipient's Unidentified-Access-Key.
+        // SyncMessage::Sent.message.profile_key is OUR key (we sent it
+        // from another device), so decode_content only returns the key
+        // for top-level peer DataMessages.
+        if let Some(pk) = peer_profile_key
+            && source_service_id != local_aci
+            && let Err(e) = self.inner.store.set_peer_profile_key(&source_service_id, &pk).await
+        {
+            warn!("process_envelope: failed to persist peer profile_key for {source_service_id}: {e}");
+        }
 
         // Remap SyncMessage::Sent destination to Recipient::SelfSync when
         // it equals our own ACI. The doc surfaces this variant so consumers
@@ -955,11 +559,23 @@ pub(crate) fn route_envelope_to_identity(
 /// on the wire). The unsealed path reads them from the wire envelope;
 /// the sealed path reads them from the validated `SenderCertificate`.
 ///
+/// Returns `(envelope, peer_profile_key)`. The second element is `Some`
+/// when the Content carries a top-level `DataMessage.profile_key` from a
+/// peer; the caller persists it into `peer_profile_keys` so subsequent
+/// outbound sends to that peer can use the sealed-sender path. The
+/// nested `SyncMessage::Sent.message.profile_key` is our own key, not
+/// a peer's, so it intentionally is not surfaced here.
+///
 /// Phase 3 surfaces DataMessage, SyncMessage::Sent, SyncMessage::Read,
 /// Receipt, Typing, Edit, Call. Unhandled Content variants fall through
 /// to `Envelope::Unknown` so consumers see them rather than silently
 /// dropping a future message type.
-fn decode_content(plaintext: &[u8], source: &str, source_device: u32, timestamp: u64) -> Option<Envelope> {
+fn decode_content(
+    plaintext: &[u8],
+    source: &str,
+    source_device: u32,
+    timestamp: u64,
+) -> (Option<Envelope>, Option<Vec<u8>>) {
     use crate::envelope::{Envelope as PubEnvelope, ReceiptKind};
     use prost::Message as _;
 
@@ -971,18 +587,23 @@ fn decode_content(plaintext: &[u8], source: &str, source_device: u32, timestamp:
         timestamp
     );
 
-    let content = proto::Content::decode(plaintext)
-        .map_err(|e| {
+    let content = match proto::Content::decode(plaintext) {
+        Ok(c) => c,
+        Err(e) => {
             warn!("decode_content: prost Content decode failed: {e}");
-            e
-        })
-        .ok()?;
+            return (None, None);
+        }
+    };
 
-    let inner = content.content?;
+    let Some(inner) = content.content else {
+        return (None, None);
+    };
     let source_recipient = service_id_to_recipient(source);
 
-    match inner {
+    let mut peer_profile_key: Option<Vec<u8>> = None;
+    let envelope = match inner {
         proto::content::Content::DataMessage(dm) => {
+            peer_profile_key = dm.profile_key.clone();
             let u = unpack_data_message(dm);
             Some(PubEnvelope::DataMessage {
                 source: source_recipient,
@@ -1039,8 +660,6 @@ fn decode_content(plaintext: &[u8], source: &str, source_device: u32, timestamp:
                 proto::content::Content::StoryMessage(_) => "story_message",
                 _ => "unknown",
             };
-            // Re-encode the inner variant so consumers can inspect or
-            // forward it as-is without re-running prost themselves.
             let raw = match other {
                 proto::content::Content::NullMessage(v) => v.encode_to_vec(),
                 proto::content::Content::DecryptionErrorMessage(v) => v,
@@ -1052,7 +671,8 @@ fn decode_content(plaintext: &[u8], source: &str, source_device: u32, timestamp:
                 raw,
             })
         }
-    }
+    };
+    (envelope, peer_profile_key)
 }
 
 /// Classify a wire `source_service_id` / `destination_service_id` string
@@ -1287,64 +907,6 @@ impl Client {
         );
         Ok(())
     }
-}
-
-/// Build the inner Content protobuf for a 1:1 send: a DataMessage with
-/// the body and timestamp, wrapped in the top-level Content.
-fn build_one_to_one_content(body: &str, timestamp: u64) -> Vec<u8> {
-    use prost::Message as _;
-
-    debug!(
-        "build_one_to_one_content: body_len={} timestamp={}",
-        body.len(),
-        timestamp
-    );
-
-    let dm = proto::DataMessage {
-        body: Some(body.to_string()),
-        timestamp: Some(timestamp),
-        ..Default::default()
-    };
-    let content = proto::Content {
-        content: Some(proto::content::Content::DataMessage(dm)),
-        ..Default::default()
-    };
-    content.encode_to_vec()
-}
-
-/// Build the inner Content protobuf for a Note-to-Self send: wraps the
-/// body as a DataMessage and tags it via SyncMessage::Sent so the
-/// receiver-side filter (`destination == own_number`) fires.
-fn build_sync_self_content(body: &str, own_destination: &str, timestamp: u64) -> Vec<u8> {
-    use prost::Message as _;
-
-    debug!(
-        "build_sync_self_content: body_len={} own_destination={} timestamp={}",
-        body.len(),
-        own_destination,
-        timestamp
-    );
-
-    let dm = proto::DataMessage {
-        body: Some(body.to_string()),
-        timestamp: Some(timestamp),
-        ..Default::default()
-    };
-    let sent = proto::sync_message::Sent {
-        destination_service_id: Some(own_destination.to_string()),
-        timestamp: Some(timestamp),
-        message: Some(dm),
-        ..Default::default()
-    };
-    let sm = proto::SyncMessage {
-        content: Some(proto::sync_message::Content::Sent(sent)),
-        ..Default::default()
-    };
-    let content = proto::Content {
-        content: Some(proto::content::Content::SyncMessage(sm)),
-        ..Default::default()
-    };
-    content.encode_to_vec()
 }
 
 /// Convert a `u32` device id loaded from storage into libsignal's

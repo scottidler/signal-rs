@@ -240,3 +240,50 @@ async fn identity_key_decode_path_handles_compressed_form() {
     assert!(loaded.is_some());
     assert_eq!(loaded.unwrap().serialize(), kp.identity_key().serialize());
 }
+
+#[tokio::test]
+async fn peer_profile_keys_round_trip_overwrites_on_repeat_insert() {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let aci = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    assert!(store.get_peer_profile_key(aci).await.unwrap().is_none());
+    let pk1 = vec![1u8; 32];
+    store.set_peer_profile_key(aci, &pk1).await.unwrap();
+    assert_eq!(store.get_peer_profile_key(aci).await.unwrap(), Some(pk1));
+    // INSERT OR REPLACE: repeat sets overwrite by aci primary key.
+    let pk2 = vec![2u8; 32];
+    store.set_peer_profile_key(aci, &pk2).await.unwrap();
+    assert_eq!(store.get_peer_profile_key(aci).await.unwrap(), Some(pk2));
+}
+
+#[tokio::test]
+async fn peer_profile_keys_keyed_by_aci_so_two_peers_dont_collide() {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let aci_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let aci_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    store.set_peer_profile_key(aci_a, &[0xA; 32]).await.unwrap();
+    store.set_peer_profile_key(aci_b, &[0xB; 32]).await.unwrap();
+    assert_eq!(store.get_peer_profile_key(aci_a).await.unwrap(), Some(vec![0xA; 32]));
+    assert_eq!(store.get_peer_profile_key(aci_b).await.unwrap(), Some(vec![0xB; 32]));
+}
+
+#[tokio::test]
+async fn sender_certificate_round_trip_returns_bytes_and_expiry() {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    assert!(store.get_sender_certificate().await.unwrap().is_none());
+    let bytes = vec![7u8, 8, 9, 10, 11];
+    let expiry_ms: u64 = 1_900_000_000_000;
+    store.set_sender_certificate(&bytes, expiry_ms).await.unwrap();
+    let (loaded_bytes, loaded_expiry) = store.get_sender_certificate().await.unwrap().unwrap();
+    assert_eq!(loaded_bytes, bytes);
+    assert_eq!(loaded_expiry, expiry_ms);
+}
+
+#[tokio::test]
+async fn sender_certificate_overwrites_on_subsequent_set() {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    store.set_sender_certificate(&[0xAA; 16], 1_000).await.unwrap();
+    store.set_sender_certificate(&[0xBB; 24], 2_000).await.unwrap();
+    let (bytes, expiry) = store.get_sender_certificate().await.unwrap().unwrap();
+    assert_eq!(bytes, vec![0xBB; 24]);
+    assert_eq!(expiry, 2_000);
+}

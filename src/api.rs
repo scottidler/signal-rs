@@ -15,7 +15,7 @@ use base64::Engine as _;
 use http::HeaderValue;
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use libsignal_protocol::GenericSignedPreKey;
-use log::{debug, info};
+use log::{debug, info, trace};
 use rand::TryRngCore;
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
@@ -468,6 +468,106 @@ fn build_prekey_upload_body(
         pq_pre_keys: Vec::new(),
         pq_last_resort_pre_key: pq_last_resort,
     })
+}
+
+/// JSON response shape for `GET /v1/certificate/delivery`. Signal's
+/// chat server returns the base64-encoded `SenderCertificate` bytes
+/// (the outer wrapper containing the signed inner certificate) as the
+/// only useful field. signal-cli's `RemoteConfigResult` analog uses
+/// the same shape.
+#[derive(Deserialize, Debug)]
+struct SenderCertificateResponse {
+    certificate: String,
+}
+
+/// Fetch our own `SenderCertificate` from the chat server, returning
+/// the raw bytes plus the certificate's expiration in epoch ms.
+///
+/// The sender-certificate endpoint accepts standard authenticated
+/// device credentials (HTTP Basic: `{aci}.{device_id}` : password).
+/// The returned blob is base64 of the protobuf-encoded
+/// `SenderCertificate`; consumers parse it via
+/// `libsignal_protocol::SenderCertificate::deserialize`.
+///
+/// Returns `(bytes, expiry_ms)`. `expiry_ms` is decoded once here so
+/// the storage layer can compare on numeric times without re-parsing
+/// the protobuf on every read.
+pub async fn fetch_sender_certificate(creds: &UploadCredentials) -> Result<(Vec<u8>, u64), ApiError> {
+    debug!(
+        "fetch_sender_certificate: service_id={} device_id={}",
+        creds.service_id, creds.device_id
+    );
+    let url = format!("{CHAT_BASE_URL}/v1/certificate/delivery");
+    let user = format!("{}.{}", creds.service_id, creds.device_id);
+    let auth_header = basic_auth_header(&user, &creds.password);
+
+    let client = http_client()?;
+    let resp = client.get(&url).header(AUTHORIZATION, auth_header).send().await?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(ApiError::Server {
+            status: status.as_u16(),
+            body: body_text,
+        });
+    }
+
+    let parsed: SenderCertificateResponse = resp.json().await?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(parsed.certificate.as_str())
+        .map_err(|e| ApiError::Server {
+            status: status.as_u16(),
+            body: format!("certificate base64: {e}"),
+        })?;
+    let cert = libsignal_protocol::SenderCertificate::deserialize(&bytes)?;
+    let expiry_ms = cert.expiration()?.epoch_millis();
+    info!(
+        "fetch_sender_certificate: bytes={} expiry_ms={}",
+        bytes.len(),
+        expiry_ms
+    );
+    Ok((bytes, expiry_ms))
+}
+
+/// Load a cached `SenderCertificate` from the store or fetch + cache
+/// a fresh one if the cached row is missing or its expiry is within
+/// the configured refresh window of `now_ms`. Returns the deserialized
+/// `SenderCertificate` ready to feed into `sealed_sender_encrypt`.
+///
+/// `now_ms` is taken as a parameter so unit tests can drive expiry
+/// scenarios without monkey-patching the system clock.
+pub async fn load_or_refresh_sender_certificate(
+    store: &SqliteStore,
+    now_ms: u64,
+) -> Result<libsignal_protocol::SenderCertificate, ApiError> {
+    // Refetch when the cached cert is within 1 hour of expiry. Signal's
+    // certs are typically valid for ~24h, so this gives roughly 23h of
+    // cache hits per fetch while keeping a safe pre-expiry buffer that
+    // forces a refresh before a send is at risk of using a stale cert.
+    const REFRESH_BEFORE_EXPIRY_MS: u64 = 60 * 60 * 1000;
+
+    debug!("load_or_refresh_sender_certificate: now_ms={}", now_ms);
+    if let Some((bytes, expiry_ms)) = store.get_sender_certificate().await? {
+        if expiry_ms > now_ms + REFRESH_BEFORE_EXPIRY_MS {
+            trace!(
+                "load_or_refresh_sender_certificate: cache hit (expiry_ms={} > now+window)",
+                expiry_ms
+            );
+            return Ok(libsignal_protocol::SenderCertificate::deserialize(&bytes)?);
+        }
+        debug!(
+            "load_or_refresh_sender_certificate: cached cert expiring soon (expiry_ms={} now_ms={}); refetching",
+            expiry_ms, now_ms
+        );
+    } else {
+        debug!("load_or_refresh_sender_certificate: no cached cert; fetching");
+    }
+
+    let creds = load_upload_credentials(store, IdentityKind::Aci).await?;
+    let (bytes, expiry_ms) = fetch_sender_certificate(&creds).await?;
+    store.set_sender_certificate(&bytes, expiry_ms).await?;
+    Ok(libsignal_protocol::SenderCertificate::deserialize(&bytes)?)
 }
 
 /// Mint a random 24-byte password, base64-encoded. Matches signal-cli's

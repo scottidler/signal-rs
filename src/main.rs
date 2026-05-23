@@ -10,7 +10,26 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use base64::Engine;
-use signal_rs::{Client, attachment, envelope::AttachmentPointer, link::link};
+use signal_rs::{Client, Recipient, attachment, envelope::AttachmentPointer, link::link};
+
+/// Parse the `--to` argument into a typed [`Recipient`]. Accepted
+/// forms (lowercase): `self`, `aci:<uuid>`. Any other form (E.164
+/// numbers, bare UUIDs, etc.) is rejected with a clear error rather
+/// than being silently mis-interpreted.
+fn parse_recipient(s: &str) -> Result<Recipient> {
+    if s == "self" {
+        return Ok(Recipient::SelfSync);
+    }
+    if let Some(uuid) = s.strip_prefix("aci:") {
+        if uuid.is_empty() {
+            return Err(eyre!("--to aci: requires a UUID after the colon"));
+        }
+        return Ok(Recipient::Aci(uuid.to_string()));
+    }
+    Err(eyre!(
+        "--to must be `self` or `aci:<uuid>`; E.164 numbers and bare UUIDs are not accepted (got {s:?})"
+    ))
+}
 
 mod cli;
 use cli::{Cli, Command};
@@ -112,14 +131,15 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Command::Send { target, message } => {
-            info!("send: target={target} body_len={}", message.len());
+        Command::Send { to, message } => {
+            let recipient = parse_recipient(&to)?;
+            info!("send: to={to} body_len={}", message.len());
             let client = Client::open(&state_dir).await.map_err(|e| eyre!("Client::open: {e}"))?;
-            client
-                .send(&target, &message)
+            let timestamp_ms = client
+                .send(recipient, &message)
                 .await
                 .map_err(|e| eyre!("Client::send: {e}"))?;
-            println!("send: dispatched to {target}");
+            println!("send: dispatched to={to} timestamp_ms={timestamp_ms}");
             Ok(())
         }
         Command::Receive { once } => {
