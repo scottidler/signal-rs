@@ -261,51 +261,51 @@ impl Client {
         }
 
         // 2. Encrypt one ciphertext per recipient device, threading
-        //    session-state writes through one transaction.
+        //    session-state writes through one transaction. TxStore owns
+        //    the transaction; sub-stores share it via Arc<Mutex<_>>.
         let pool = self.inner.store.pool().clone();
-        let mut tx = pool.begin().await.map_err(StoreError::from)?;
+        let tx = pool.begin().await.map_err(StoreError::from)?;
+        let tx_store = crate::storage::tx::TxStore::new(tx);
+        let mut session = tx_store.session_store();
+        let mut identity = tx_store.identity_store();
         let mut outbound: Vec<SingleOutboundUnsealedMessage<CiphertextMessage>> = Vec::with_capacity(bundles.len());
 
-        {
-            let tx_store = crate::storage::tx::TxStore::new(&mut tx);
-            let mut session = tx_store.session_store();
-            let mut identity = tx_store.identity_store();
+        for bundle in bundles.iter() {
+            let device_id = bundle.device_id().map_err(SendError::Signal)?;
+            let registration_id = bundle.registration_id().map_err(SendError::Signal)?;
+            let remote_address = ProtocolAddress::new(target.service_id_string(), device_id);
 
-            for bundle in bundles.iter() {
-                let device_id = bundle.device_id().map_err(SendError::Signal)?;
-                let registration_id = bundle.registration_id().map_err(SendError::Signal)?;
-                let remote_address = ProtocolAddress::new(target.service_id_string(), device_id);
+            libsignal_protocol::process_prekey_bundle(
+                &remote_address,
+                &local_address,
+                &mut session,
+                &mut identity,
+                bundle,
+                std::time::SystemTime::now(),
+                &mut rand::rng(),
+            )
+            .await?;
 
-                libsignal_protocol::process_prekey_bundle(
-                    &remote_address,
-                    &local_address,
-                    &mut session,
-                    &mut identity,
-                    bundle,
-                    std::time::SystemTime::now(),
-                    &mut rand::rng(),
-                )
-                .await?;
-
-                let content_bytes = build_one_to_one_content(body, now_millis());
-                let ciphertext = libsignal_protocol::message_encrypt(
-                    &content_bytes,
-                    &remote_address,
-                    &local_address,
-                    &mut session,
-                    &mut identity,
-                    std::time::SystemTime::now(),
-                    &mut rand::rng(),
-                )
-                .await?;
-                outbound.push(SingleOutboundUnsealedMessage {
-                    device_id,
-                    registration_id,
-                    contents: ciphertext,
-                });
-            }
+            let content_bytes = build_one_to_one_content(body, now_millis());
+            let ciphertext = libsignal_protocol::message_encrypt(
+                &content_bytes,
+                &remote_address,
+                &local_address,
+                &mut session,
+                &mut identity,
+                std::time::SystemTime::now(),
+                &mut rand::rng(),
+            )
+            .await?;
+            outbound.push(SingleOutboundUnsealedMessage {
+                device_id,
+                registration_id,
+                contents: ciphertext,
+            });
         }
-        tx.commit().await.map_err(StoreError::from)?;
+        drop(session);
+        drop(identity);
+        tx_store.commit().await.map_err(StoreError::from)?;
 
         // 3. Dispatch over the authenticated chat WebSocket.
         let (auth_chat, auth_events) = self
@@ -570,29 +570,33 @@ impl Client {
         let remote_address = ProtocolAddress::new(source_service_id.to_string(), device_id_from_u32(source_device)?);
 
         let pool = self.inner.store.pool().clone();
-        let mut tx = pool.begin().await.map_err(StoreError::from)?;
-        let plaintext = {
-            let tx_store = crate::storage::tx::TxStore::new(&mut tx);
-            let mut session = tx_store.session_store();
-            let mut identity = tx_store.identity_store();
-            let mut pre_key = tx_store.pre_key_store();
-            let signed_pre_key = tx_store.signed_pre_key_store();
-            let mut kyber = tx_store.kyber_pre_key_store();
+        let tx = pool.begin().await.map_err(StoreError::from)?;
+        let tx_store = crate::storage::tx::TxStore::new(tx);
+        let mut session = tx_store.session_store();
+        let mut identity = tx_store.identity_store();
+        let mut pre_key = tx_store.pre_key_store();
+        let signed_pre_key = tx_store.signed_pre_key_store();
+        let mut kyber = tx_store.kyber_pre_key_store();
 
-            libsignal_protocol::message_decrypt(
-                &ciphertext,
-                &remote_address,
-                local_address,
-                &mut session,
-                &mut identity,
-                &mut pre_key,
-                &signed_pre_key,
-                &mut kyber,
-                &mut rand::rng(),
-            )
-            .await?
-        };
-        tx.commit().await.map_err(StoreError::from)?;
+        let plaintext = libsignal_protocol::message_decrypt(
+            &ciphertext,
+            &remote_address,
+            local_address,
+            &mut session,
+            &mut identity,
+            &mut pre_key,
+            &signed_pre_key,
+            &mut kyber,
+            &mut rand::rng(),
+        )
+        .await?;
+
+        drop(session);
+        drop(identity);
+        drop(pre_key);
+        drop(signed_pre_key);
+        drop(kyber);
+        tx_store.commit().await.map_err(StoreError::from)?;
 
         let decoded = decode_content(&plaintext, &wire);
         Ok(decoded)

@@ -26,15 +26,15 @@ async fn rollback_discards_all_writes_atomically() {
     let mut rng = ChaCha20Rng::seed_from_u64(0);
     let peer_kp = IdentityKeyPair::generate(&mut rng);
 
-    let mut tx = store.pool().begin().await.unwrap();
+    let tx = store.pool().begin().await.unwrap();
     {
-        let mut tx_store = TxStore::new(&mut tx);
+        let mut tx_store = TxStore::new(tx);
         let record = SessionRecord::new_fresh();
         tx_store.store_session(&addr, &record).await.unwrap();
         tx_store.save_identity(&addr, peer_kp.identity_key()).await.unwrap();
+        // Drop tx_store without commit - all writes should be rolled
+        // back when the Transaction inside drops.
     }
-    // Drop tx without committing - all writes should disappear.
-    drop(tx);
 
     let session = SessionStore::load_session(&store.clone(), &addr).await.unwrap();
     let identity: Option<IdentityKey> = IdentityKeyStore::get_identity(&store.clone(), &addr).await.unwrap();
@@ -48,8 +48,8 @@ async fn reads_via_txstore_observe_transaction_local_writes() {
     let store = SqliteStore::open_in_memory().await.unwrap();
     let addr = fixed_address();
 
-    let mut tx = store.pool().begin().await.unwrap();
-    let mut tx_store = TxStore::new(&mut tx);
+    let tx = store.pool().begin().await.unwrap();
+    let mut tx_store = TxStore::new(tx);
     let record = SessionRecord::new_fresh();
 
     assert!(tx_store.load_session(&addr).await.unwrap().is_none());
@@ -82,14 +82,16 @@ async fn prekey_consumption_and_session_update_commit_together() {
 
     // In one transaction, simulate the receive-loop critical section:
     // consume the prekey + write a new session.
-    let mut tx = store.pool().begin().await.unwrap();
+    let tx = store.pool().begin().await.unwrap();
+    let tx_store = TxStore::new(tx);
     {
-        let mut tx_store = TxStore::new(&mut tx);
-        tx_store.remove_pre_key(id).await.unwrap();
+        let mut sub_pre_key = tx_store.pre_key_store();
+        let mut sub_session = tx_store.session_store();
+        sub_pre_key.remove_pre_key(id).await.unwrap();
         let session = SessionRecord::new_fresh();
-        tx_store.store_session(&addr, &session).await.unwrap();
+        sub_session.store_session(&addr, &session).await.unwrap();
     }
-    tx.commit().await.unwrap();
+    tx_store.commit().await.unwrap();
 
     // Both effects are now visible at the pool.
     assert!(
@@ -117,14 +119,14 @@ async fn prekey_consumption_rolls_back_if_session_write_is_dropped() {
         .await
         .unwrap();
 
-    let mut tx = store.pool().begin().await.unwrap();
+    let tx = store.pool().begin().await.unwrap();
     {
-        let mut tx_store = TxStore::new(&mut tx);
-        tx_store.remove_pre_key(id).await.unwrap();
+        let tx_store = TxStore::new(tx);
+        let mut sub_pre_key = tx_store.pre_key_store();
+        sub_pre_key.remove_pre_key(id).await.unwrap();
+        // Drop tx_store without commit() - simulating a panic mid-
+        // decrypt before the session write would have happened.
     }
-    // Drop without commit - simulating a panic mid-decrypt before the
-    // session write would have happened.
-    drop(tx);
 
     // The prekey must still exist - if rollback didn't fire, the next
     // boot would replay the envelope but the prekey would be gone.
