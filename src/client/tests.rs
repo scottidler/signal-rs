@@ -194,6 +194,7 @@ fn route_aci_destination_works_without_local_pni() {
 
 use crate::client::{build_one_to_one_content, build_sync_self_content, decode_content};
 use crate::crypto::provisioning::proto;
+use crate::envelope::{Envelope as PubEnvelope, ReceiptKind, Recipient, SyncMessage as PubSyncMessage};
 
 #[test]
 fn decode_content_data_message_round_trips_through_build_one_to_one() {
@@ -201,19 +202,21 @@ fn decode_content_data_message_round_trips_through_build_one_to_one() {
     let ts = 1_700_000_000_123_u64;
     let plaintext = build_one_to_one_content(body, ts);
 
-    let env = decode_content(&plaintext, ACI, ts).expect("DataMessage Content decodes");
-    let crate::envelope::Envelope::DataMessage {
+    let env = decode_content(&plaintext, ACI, 1, ts).expect("DataMessage Content decodes");
+    let PubEnvelope::DataMessage {
         source,
+        source_device,
         timestamp,
-        message,
+        body: env_body,
+        ..
     } = env
     else {
         panic!("expected Envelope::DataMessage, got something else");
     };
-    assert_eq!(source, ACI);
+    assert_eq!(source, Recipient::Aci(ACI.to_string()));
+    assert_eq!(source_device, 1);
     assert_eq!(timestamp, ts);
-    assert_eq!(message.body.as_deref(), Some(body));
-    assert_eq!(message.timestamp, ts);
+    assert_eq!(env_body.as_deref(), Some(body));
 }
 
 #[test]
@@ -223,29 +226,28 @@ fn decode_content_sync_sent_round_trips_through_build_sync_self() {
     let ts = 1_700_000_000_456_u64;
     let plaintext = build_sync_self_content(body, own, ts);
     // Wire-envelope source is the primary's service-id; the public
-    // SyncMessage::Sent.destination comes from the SyncMessage payload,
-    // not the wire envelope. Pass ACI as the source so we can confirm
-    // it is NOT what populates `destination`.
-    let env = decode_content(&plaintext, ACI, ts).expect("SyncMessage Content decodes");
-    let crate::envelope::Envelope::SyncMessage(crate::envelope::SyncMessage::Sent {
+    // SyncMessage::Sent.destination comes from the SyncMessage payload.
+    // SelfSync remapping is done by process_envelope, not decode_content,
+    // so here we expect Recipient::Aci(own) (the raw destination string).
+    let env = decode_content(&plaintext, ACI, 1, ts).expect("SyncMessage Content decodes");
+    let PubEnvelope::SyncMessage(PubSyncMessage::Sent {
         destination,
         timestamp,
-        message,
+        body: env_body,
+        ..
     }) = env
     else {
         panic!("expected Envelope::SyncMessage(Sent), got something else");
     };
-    assert_eq!(destination, own);
+    assert_eq!(destination, Some(Recipient::Aci(own.to_string())));
     assert_eq!(timestamp, ts);
-    assert_eq!(message.body.as_deref(), Some(body));
-    assert_eq!(message.timestamp, ts);
+    assert_eq!(env_body.as_deref(), Some(body));
 }
 
 #[test]
-fn decode_content_drops_unhandled_variants() {
-    // A TypingMessage Content is valid signalservice but is not surfaced
-    // until Phase 3. decode_content must return None rather than panic
-    // or misroute it as DataMessage/SyncMessage.
+fn decode_content_typing_message_surfaces_typing_variant() {
+    // Phase 3 surfaces TypingMessage as Envelope::Typing rather than
+    // dropping it.
     use prost::Message as _;
     let typing = proto::TypingMessage {
         timestamp: Some(1_700_000_000_789),
@@ -257,21 +259,136 @@ fn decode_content_drops_unhandled_variants() {
         ..Default::default()
     };
     let plaintext = content.encode_to_vec();
-    assert!(decode_content(&plaintext, ACI, 1_700_000_000_789).is_none());
+    let env = decode_content(&plaintext, ACI, 1, 0).expect("Typing surfaces");
+    let PubEnvelope::Typing { started, timestamp, .. } = env else {
+        panic!("expected Envelope::Typing");
+    };
+    assert!(started);
+    assert_eq!(timestamp, 1_700_000_000_789);
+}
+
+#[test]
+fn decode_content_receipt_message_surfaces_receipt_variant_with_kind() {
+    use prost::Message as _;
+    let receipt = proto::ReceiptMessage {
+        r#type: Some(proto::receipt_message::Type::Read as i32),
+        timestamp: vec![1_700_000_000, 1_700_000_001],
+    };
+    let content = proto::Content {
+        content: Some(proto::content::Content::ReceiptMessage(receipt)),
+        ..Default::default()
+    };
+    let plaintext = content.encode_to_vec();
+    let env = decode_content(&plaintext, ACI, 1, 0).expect("Receipt surfaces");
+    let PubEnvelope::Receipt {
+        receipt_kind,
+        timestamps,
+        ..
+    } = env
+    else {
+        panic!("expected Envelope::Receipt");
+    };
+    assert!(matches!(receipt_kind, ReceiptKind::Read));
+    assert_eq!(timestamps, vec![1_700_000_000, 1_700_000_001]);
+}
+
+#[test]
+fn decode_content_edit_message_surfaces_edit_variant() {
+    use prost::Message as _;
+    let inner_dm = proto::DataMessage {
+        body: Some("edited body".to_string()),
+        ..Default::default()
+    };
+    let edit = proto::EditMessage {
+        target_sent_timestamp: Some(1_700_000_000),
+        data_message: Some(inner_dm),
+    };
+    let content = proto::Content {
+        content: Some(proto::content::Content::EditMessage(edit)),
+        ..Default::default()
+    };
+    let plaintext = content.encode_to_vec();
+    let env = decode_content(&plaintext, ACI, 1, 1_800_000_000).expect("Edit surfaces");
+    let PubEnvelope::Edit {
+        target_sent_timestamp,
+        body,
+        timestamp,
+        ..
+    } = env
+    else {
+        panic!("expected Envelope::Edit");
+    };
+    assert_eq!(target_sent_timestamp, 1_700_000_000);
+    assert_eq!(timestamp, 1_800_000_000);
+    assert_eq!(body.as_deref(), Some("edited body"));
+}
+
+#[test]
+fn decode_content_call_message_surfaces_call_variant_with_raw_bytes() {
+    use prost::Message as _;
+    let call = proto::CallMessage::default();
+    let content = proto::Content {
+        content: Some(proto::content::Content::CallMessage(call)),
+        ..Default::default()
+    };
+    let plaintext = content.encode_to_vec();
+    let env = decode_content(&plaintext, ACI, 1, 0).expect("Call surfaces");
+    assert!(matches!(env, PubEnvelope::Call { .. }));
+}
+
+#[test]
+fn decode_content_sync_read_surfaces_sync_read_variant() {
+    use prost::Message as _;
+    let sender_aci = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    let sm = proto::SyncMessage {
+        read: vec![proto::sync_message::Read {
+            sender_aci: Some(sender_aci.to_string()),
+            timestamp: Some(1_700_000_000),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let content = proto::Content {
+        content: Some(proto::content::Content::SyncMessage(sm)),
+        ..Default::default()
+    };
+    let plaintext = content.encode_to_vec();
+    let env = decode_content(&plaintext, ACI, 1, 0).expect("SyncMessage::Read surfaces");
+    let PubEnvelope::SyncMessage(PubSyncMessage::Read { reads }) = env else {
+        panic!("expected Envelope::SyncMessage(Read)");
+    };
+    assert_eq!(reads.len(), 1);
+    assert_eq!(reads[0].timestamp, 1_700_000_000);
+    assert_eq!(reads[0].sender, Recipient::Aci(sender_aci.to_string()));
 }
 
 #[test]
 fn decode_content_returns_none_for_empty_content() {
-    // An empty Content (no oneof set) is on the wire as zero bytes once
-    // serialized. decode_content must not synthesize a DataMessage or
-    // SyncMessage from nothing.
+    // An empty Content (no oneof set, no `read` payload) must not
+    // synthesize a DataMessage/SyncMessage from nothing.
     use prost::Message as _;
     let plaintext = proto::Content::default().encode_to_vec();
-    assert!(decode_content(&plaintext, ACI, 1_700_000_000).is_none());
+    assert!(decode_content(&plaintext, ACI, 1, 1_700_000_000).is_none());
 }
 
 #[test]
 fn decode_content_returns_none_on_undecodable_bytes() {
     let plaintext = b"this is not a valid protobuf";
-    assert!(decode_content(plaintext, ACI, 0).is_none());
+    assert!(decode_content(plaintext, ACI, 1, 0).is_none());
+}
+
+#[test]
+fn service_id_to_recipient_classifies_pni_prefix() {
+    use crate::client::service_id_to_recipient;
+    let pni_input = "PNI:99999999-9999-9999-9999-999999999999";
+    let r = service_id_to_recipient(pni_input);
+    assert_eq!(r, Recipient::Pni("99999999-9999-9999-9999-999999999999".to_string()));
+}
+
+#[test]
+fn service_id_to_recipient_classifies_bare_uuid_as_aci() {
+    use crate::client::service_id_to_recipient;
+    let aci_input = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let r = service_id_to_recipient(aci_input);
+    assert_eq!(r, Recipient::Aci(aci_input.to_string()));
 }

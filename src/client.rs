@@ -867,7 +867,22 @@ impl Client {
         tx_store.commit().await.map_err(StoreError::from)?;
 
         let timestamp = wire.client_timestamp.unwrap_or(0);
-        let decoded = decode_content(&plaintext, &source_service_id, timestamp);
+        let source_device: u32 = remote_address.device_id().into();
+        let mut decoded = decode_content(&plaintext, &source_service_id, source_device, timestamp);
+
+        // Remap SyncMessage::Sent destination to Recipient::SelfSync when
+        // it equals our own ACI. The doc surfaces this variant so consumers
+        // can filter Note-to-Self without string-comparing their own ACI.
+        if let Some(Envelope::SyncMessage(crate::envelope::SyncMessage::Sent {
+            destination: dest @ Some(_),
+            ..
+        })) = decoded.as_mut()
+            && let Some(crate::envelope::Recipient::Aci(aci_string)) = dest.as_ref()
+            && aci_string == &local_aci
+        {
+            *dest = Some(crate::envelope::Recipient::SelfSync);
+        }
+
         Ok(decoded)
     }
 }
@@ -919,24 +934,27 @@ pub(crate) fn route_envelope_to_identity(
 }
 
 /// Translate decrypted Signal Content protobuf bytes into our public
-/// [`Envelope`] enum. Decodes via prost-generated `signalservice::Content`
-/// (replaces the earlier hand-rolled minimal decoders). v0.1 surfaces
-/// DataMessage and SyncMessage::Sent; receipts/typing/edit are stubbed
-/// and dropped here for Phase 1 (Phase 3 maps them onto the public enum).
+/// [`Envelope`] enum. Decodes via prost-generated `signalservice::Content`.
 ///
-/// `source` and `timestamp` are supplied by the caller because sealed-sender
-/// envelopes carry sender identity inside the encrypted USMC (no plaintext
-/// `source_service_id` on the wire). The unsealed path reads them from the
-/// wire envelope's `source_service_id` and `client_timestamp`; the sealed
-/// path reads them from the validated `SenderCertificate`.
-fn decode_content(plaintext: &[u8], source: &str, timestamp: u64) -> Option<Envelope> {
-    use crate::envelope::{DataMessage as PubDataMessage, SyncMessage as PubSyncMessage};
+/// `source`, `source_device`, and `timestamp` are supplied by the caller
+/// because sealed-sender envelopes carry sender identity inside the
+/// encrypted USMC (no plaintext `source_service_id`/`source_device_id`
+/// on the wire). The unsealed path reads them from the wire envelope;
+/// the sealed path reads them from the validated `SenderCertificate`.
+///
+/// Phase 3 surfaces DataMessage, SyncMessage::Sent, SyncMessage::Read,
+/// Receipt, Typing, Edit, Call. Unhandled Content variants fall through
+/// to `Envelope::Unknown` so consumers see them rather than silently
+/// dropping a future message type.
+fn decode_content(plaintext: &[u8], source: &str, source_device: u32, timestamp: u64) -> Option<Envelope> {
+    use crate::envelope::{Envelope as PubEnvelope, ReceiptKind};
     use prost::Message as _;
 
     debug!(
-        "decode_content: plaintext_len={} source={} timestamp={}",
+        "decode_content: plaintext_len={} source={} source_device={} timestamp={}",
         plaintext.len(),
         source,
+        source_device,
         timestamp
     );
 
@@ -947,37 +965,207 @@ fn decode_content(plaintext: &[u8], source: &str, timestamp: u64) -> Option<Enve
         })
         .ok()?;
 
-    match content.content? {
+    let inner = content.content?;
+    let source_recipient = service_id_to_recipient(source);
+
+    match inner {
         proto::content::Content::DataMessage(dm) => {
-            let message = PubDataMessage {
-                body: dm.body,
+            let u = unpack_data_message(dm);
+            Some(PubEnvelope::DataMessage {
+                source: source_recipient,
+                source_device,
                 timestamp,
-            };
-            Some(Envelope::DataMessage {
-                source: source.to_string(),
-                timestamp,
-                message,
+                group_id: u.group_id,
+                body: u.body,
+                attachments: u.attachments,
+                quote: u.quote,
+                edit_of_timestamp: None,
+                expire_in_seconds: u.expire_in_seconds,
             })
         }
-        proto::content::Content::SyncMessage(sm) => {
-            let proto::sync_message::Content::Sent(sent) = sm.content? else {
-                return None;
+        proto::content::Content::SyncMessage(sm) => decode_sync_message(sm, timestamp),
+        proto::content::Content::ReceiptMessage(rm) => {
+            let receipt_kind = match rm.r#type() {
+                proto::receipt_message::Type::Delivery => ReceiptKind::Delivery,
+                proto::receipt_message::Type::Read => ReceiptKind::Read,
+                proto::receipt_message::Type::Viewed => ReceiptKind::Viewed,
             };
-            let destination = sent.destination_service_id.unwrap_or_default();
-            let sync_timestamp = sent.timestamp.unwrap_or(timestamp);
-            let body = sent.message.and_then(|m| m.body);
-            let message = PubDataMessage {
+            Some(PubEnvelope::Receipt {
+                receipt_kind,
+                source: source_recipient,
+                timestamps: rm.timestamp,
+            })
+        }
+        proto::content::Content::TypingMessage(tm) => {
+            let started = matches!(tm.action(), proto::typing_message::Action::Started);
+            Some(PubEnvelope::Typing {
+                source: source_recipient,
+                group_id: tm.group_id,
+                started,
+                timestamp: tm.timestamp.unwrap_or(timestamp),
+            })
+        }
+        proto::content::Content::EditMessage(em) => {
+            let target_sent_timestamp = em.target_sent_timestamp.unwrap_or(0);
+            let body = em.data_message.and_then(|dm| dm.body);
+            Some(PubEnvelope::Edit {
+                source: source_recipient,
+                timestamp,
+                target_sent_timestamp,
                 body,
-                timestamp: sync_timestamp,
+            })
+        }
+        proto::content::Content::CallMessage(cm) => Some(PubEnvelope::Call {
+            source: source_recipient,
+            raw: cm.encode_to_vec(),
+        }),
+        other => {
+            let type_tag = match &other {
+                proto::content::Content::NullMessage(_) => "null_message",
+                proto::content::Content::DecryptionErrorMessage(_) => "decryption_error_message",
+                proto::content::Content::StoryMessage(_) => "story_message",
+                _ => "unknown",
             };
-            Some(Envelope::SyncMessage(PubSyncMessage::Sent {
+            // Re-encode the inner variant so consumers can inspect or
+            // forward it as-is without re-running prost themselves.
+            let raw = match other {
+                proto::content::Content::NullMessage(v) => v.encode_to_vec(),
+                proto::content::Content::DecryptionErrorMessage(v) => v,
+                proto::content::Content::StoryMessage(v) => v.encode_to_vec(),
+                _ => Vec::new(),
+            };
+            Some(PubEnvelope::Unknown {
+                type_tag: type_tag.to_string(),
+                raw,
+            })
+        }
+    }
+}
+
+/// Classify a wire `source_service_id` / `destination_service_id` string
+/// into a typed [`crate::envelope::Recipient`]. Signal uses a `PNI:`
+/// prefix on PNI service-ids; bare UUIDs are ACIs.
+fn service_id_to_recipient(s: &str) -> crate::envelope::Recipient {
+    use crate::envelope::Recipient;
+    if let Some(pni) = s.strip_prefix("PNI:") {
+        Recipient::Pni(pni.to_string())
+    } else {
+        Recipient::Aci(s.to_string())
+    }
+}
+
+/// The Phase 3 surface fields pulled out of a prost-generated DataMessage.
+/// `edit_of_timestamp` is sourced separately by the EditMessage decode arm.
+struct UnpackedDataMessage {
+    group_id: Option<Vec<u8>>,
+    body: Option<String>,
+    attachments: Vec<crate::envelope::AttachmentPointer>,
+    quote: Option<crate::envelope::Quote>,
+    expire_in_seconds: Option<u32>,
+}
+
+fn unpack_data_message(dm: proto::DataMessage) -> UnpackedDataMessage {
+    UnpackedDataMessage {
+        group_id: dm.group_v2.and_then(|g| g.master_key),
+        body: dm.body,
+        attachments: dm.attachments.into_iter().map(map_attachment).collect(),
+        quote: dm.quote.map(map_quote),
+        expire_in_seconds: dm.expire_timer,
+    }
+}
+
+fn map_attachment(p: proto::AttachmentPointer) -> crate::envelope::AttachmentPointer {
+    use crate::envelope::AttachmentPointer as Pub;
+    let flags = p.flags.unwrap_or(0);
+    let voice_note = flags & (proto::attachment_pointer::Flags::VoiceMessage as u32) != 0;
+    let borderless = flags & (proto::attachment_pointer::Flags::Borderless as u32) != 0;
+    let gif = flags & (proto::attachment_pointer::Flags::Gif as u32) != 0;
+    let (cdn_id, cdn_key) = match p.attachment_identifier {
+        Some(proto::attachment_pointer::AttachmentIdentifier::CdnId(id)) => (id, None),
+        Some(proto::attachment_pointer::AttachmentIdentifier::CdnKey(k)) => (0, Some(k)),
+        None => (0, None),
+    };
+    Pub {
+        cdn_id,
+        cdn_key,
+        cdn_number: p.cdn_number.unwrap_or(0),
+        content_type: p.content_type,
+        size: p.size,
+        digest: p.digest.unwrap_or_default(),
+        key: p.key.unwrap_or_default(),
+        file_name: p.file_name,
+        caption: p.caption,
+        width: p.width,
+        height: p.height,
+        voice_note,
+        borderless,
+        gif,
+        upload_timestamp: p.upload_timestamp,
+        blurhash: p.blur_hash,
+    }
+}
+
+fn map_quote(q: proto::data_message::Quote) -> crate::envelope::Quote {
+    crate::envelope::Quote {
+        id: q.id.unwrap_or(0),
+        author: q
+            .author_aci
+            .as_deref()
+            .map(service_id_to_recipient)
+            .unwrap_or(crate::envelope::Recipient::Aci(String::new())),
+        text: q.text,
+    }
+}
+
+fn decode_sync_message(sm: proto::SyncMessage, fallback_timestamp: u64) -> Option<Envelope> {
+    use crate::envelope::{Envelope as PubEnvelope, ReadReceipt, Recipient, SyncMessage as PubSyncMessage};
+
+    // SyncMessage.read is a `repeated` field outside the oneof; check it
+    // first so a SyncMessage carrying only read-receipts still surfaces.
+    if !sm.read.is_empty() {
+        let reads = sm
+            .read
+            .into_iter()
+            .map(|r| ReadReceipt {
+                sender: r
+                    .sender_aci
+                    .as_deref()
+                    .map(service_id_to_recipient)
+                    .unwrap_or(Recipient::Aci(String::new())),
+                timestamp: r.timestamp.unwrap_or(0),
+            })
+            .collect();
+        return Some(PubEnvelope::SyncMessage(PubSyncMessage::Read { reads }));
+    }
+
+    let inner = sm.content?;
+    match inner {
+        proto::sync_message::Content::Sent(sent) => {
+            let destination = sent.destination_service_id.as_deref().map(service_id_to_recipient);
+            let sync_timestamp = sent.timestamp.unwrap_or(fallback_timestamp);
+            // SyncMessage::Sent surfaces destination/body/attachments
+            // but not the inner quote (the originating DataMessage's
+            // quote was already mirrored when it arrived as the peer's
+            // DataMessage; we don't want to duplicate it here).
+            let u = sent.message.map(unpack_data_message).unwrap_or(UnpackedDataMessage {
+                group_id: None,
+                body: None,
+                attachments: Vec::new(),
+                quote: None,
+                expire_in_seconds: None,
+            });
+            Some(PubEnvelope::SyncMessage(PubSyncMessage::Sent {
                 destination,
+                group_id: u.group_id,
                 timestamp: sync_timestamp,
-                message,
+                body: u.body,
+                attachments: u.attachments,
+                edit_of_timestamp: None,
+                expire_in_seconds: u.expire_in_seconds,
             }))
         }
-        other => {
-            trace!("decode_content: dropping unhandled Content variant {other:?}");
+        _ => {
+            trace!("decode_sync_message: dropping non-Sent/non-Read sync sub-variant");
             None
         }
     }

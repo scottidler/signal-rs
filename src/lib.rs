@@ -9,8 +9,9 @@
 //!
 //! Public surface:
 //! - [`Client`] - the primary entry; one per state directory.
-//! - [`Envelope`] / [`DataMessage`] / [`SyncMessage`] - what
-//!   `Client::receive` yields.
+//! - [`Envelope`] / [`SyncMessage`] / [`Recipient`] / [`ReceiptKind`] /
+//!   [`ReadReceipt`] / [`AttachmentPointer`] - what `Client::receive`
+//!   yields. JSON-serializable for line-delimited stdout consumption.
 //! - [`SqliteStore`] / [`Store`] / [`TxStore`] - storage backends.
 //! - [`link`], [`finalize_link`], [`persist_provision_message`] -
 //!   provisioning helpers; usable directly by consumers who drive
@@ -28,6 +29,6 @@ pub mod storage;
 
 pub use client::{Client, OpenError, ReceiveError, SendError};
 pub use config::Config;
-pub use envelope::{DataMessage, Envelope, SyncMessage};
+pub use envelope::{AttachmentPointer, Envelope, ReadReceipt, ReceiptKind, Recipient, SyncMessage};
 pub use link::{LinkError, LinkOutcome, finalize_link, mark_linked, persist_provision_message, prepare_link_session};
 pub use storage::{Identity, LinkStatus, SqliteStore, Store, StoreError, TxStore};
