@@ -461,21 +461,41 @@ worse than it found it.
 #### Phase 1: Vendor SignalService.proto + replace decoders
 **Model:** opus
 
-- Fetch `SignalService.proto` from
-  `signalapp/libsignal-service-java`, place at
-  `src/proto/service.proto`. The file is BSD-3-Clause licensed
-  (or whatever libsignal-service-java's license is; verify and
-  preserve the header).
-- Architect Round 1 finding 2: before writing any prost mapping,
-  empirically verify the field tags this doc names (specifically
-  `SyncMessage.Sent.message = 3`,
-  `SyncMessage.Sent.destination_service_id = 11`,
-  `Content.data_message = 1`, `Content.sync_message = 2`,
-  `Content.receipt_message = 5`, `Content.typing_message = 6`,
-  `Content.unidentified_sender_message_content`) against the
-  fetched .proto file. The minimal-decoder bug we're fixing came
-  from exactly this kind of unchecked memory; do not let it
-  recur.
+- Fetch `SignalService.proto` from the active Turasa fork
+  (`Turasa/libsignal-service-java` at tag
+  `v2.15.3_unofficial_146`, the tag signal-cli pins via
+  `signalnetwork`), path
+  `lib/libsignal-service/src/main/protowire/SignalService.proto`.
+  Place at `src/proto/service.proto`. The file header reads
+  `SPDX-License-Identifier: AGPL-3.0-only`; the repo LICENSE is
+  GPL-3.0; signal-rs is already `AGPL-3.0-or-later`, so compatible.
+  Preserve the upstream copyright + SPDX header verbatim. The
+  upstream `signalapp/libsignal-service-java` is archived; do not
+  use it.
+- Architect Round 1 finding 2 verification (done as part of this
+  doc rev; field tags below were empirically read from the fetched
+  v2.15.3_unofficial_146 .proto):
+  - `Content.dataMessage = 1` ✓
+  - `Content.syncMessage = 2` ✓
+  - `Content.callMessage = 3`
+  - `Content.receiptMessage = 5` ✓
+  - `Content.typingMessage = 6` ✓
+  - `Content.editMessage = 11`
+  - `Content.storyMessage = 9`
+  - `SyncMessage.Sent.message = 3` ✓
+  - `SyncMessage.Sent.destinationServiceId = 7` (NOT 11 as
+    earlier draft claimed; field 11 is `reserved /*destinationPni*/`)
+  - `SyncMessage.Sent.destinationServiceIdBinary = 12` (the 16-byte
+    binary form; prefer this over the string field where present,
+    mirroring signal-cli)
+  - `UnidentifiedSenderMessageContent` is the OUTER sealed-sender
+    wrapper (used when `Envelope.type == UNIDENTIFIED_SENDER`); it
+    is not a Content field. After `sealed_sender_decrypt_to_usmc`,
+    `usmc.contents()` returns the inner serialized `Content` bytes
+    which then decode as the normal Content above.
+  The earlier draft of this doc named two of these wrong; the
+  minimal-decoder bug we are fixing came from exactly this kind of
+  unchecked memory, do not let it recur.
 - Update `build.rs` to compile it alongside `envelope.proto` and
   `provisioning.proto`.
 - Delete `decode_content`'s `TopLevelContent`,

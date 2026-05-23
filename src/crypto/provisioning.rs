@@ -37,10 +37,21 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::Zeroize;
 
+#[allow(clippy::large_enum_variant)]
 pub mod proto {
     //! prost-generated types from `src/proto/*.proto`. Both
-    //! `provisioning.proto` and `envelope.proto` share package
-    //! `signalservice`; prost emits them into one Rust module.
+    //! `provisioning.proto` and `service.proto` share package
+    //! `signalservice`; prost emits them into one Rust module. The
+    //! module name happens to live under `crypto::provisioning` for
+    //! historical reasons (it was first introduced for provisioning);
+    //! moving it to a top-level `crate::proto` is a separate refactor.
+    //!
+    //! `large_enum_variant` is allowed crate-locally because the
+    //! generated oneof enums (e.g. `sync_message::Content::Sent(Sent)`)
+    //! have unavoidable size disparity from the protobuf shape; boxing
+    //! the heavy variants is the typical workaround but would need
+    //! prost-build configuration and a coordinated touch across every
+    //! match arm. Generated code, accepted as-is.
     include!(concat!(env!("OUT_DIR"), "/signalservice.rs"));
 }
 

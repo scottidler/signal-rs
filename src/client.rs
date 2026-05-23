@@ -741,8 +741,8 @@ impl Client {
         };
 
         let ciphertext = match envelope_type {
-            proto::envelope::Type::Ciphertext => CiphertextMessage::SignalMessage(SignalMessage::try_from(content)?),
-            proto::envelope::Type::PrekeyBundle => {
+            proto::envelope::Type::DoubleRatchet => CiphertextMessage::SignalMessage(SignalMessage::try_from(content)?),
+            proto::envelope::Type::PrekeyMessage => {
                 CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::try_from(content)?)
             }
             other => {
@@ -755,7 +755,7 @@ impl Client {
             .source_service_id
             .as_deref()
             .ok_or(ReceiveError::MissingCredential("source_service_id"))?;
-        let source_device = wire.source_device.unwrap_or(1);
+        let source_device = wire.source_device_id.unwrap_or(1);
         let remote_address = ProtocolAddress::new(source_service_id.to_string(), device_id_from_u32(source_device)?);
 
         // Route by envelope.destination_service_id (wire tag 13). The
@@ -859,115 +859,60 @@ pub(crate) fn route_envelope_to_identity(
 }
 
 /// Translate decrypted Signal Content protobuf bytes into our public
-/// [`Envelope`] enum. v0.1 surfaces DataMessage and SyncMessage::Sent;
-/// everything else is dropped.
+/// [`Envelope`] enum. Decodes via prost-generated `signalservice::Content`
+/// (replaces the earlier hand-rolled minimal decoders). v0.1 surfaces
+/// DataMessage and SyncMessage::Sent; receipts/typing/edit are stubbed
+/// and dropped here for Phase 1 (Phase 3 maps them onto the public enum).
 fn decode_content(plaintext: &[u8], wire: &proto::Envelope) -> Option<Envelope> {
+    use crate::envelope::{DataMessage as PubDataMessage, SyncMessage as PubSyncMessage};
+    use prost::Message as _;
+
     debug!(
         "decode_content: plaintext_len={} envelope_type={:?}",
         plaintext.len(),
         wire.r#type()
     );
-    use crate::envelope::{DataMessage, SyncMessage};
 
-    let content = decode_top_level_content(plaintext)?;
+    let content = proto::Content::decode(plaintext)
+        .map_err(|e| {
+            warn!("decode_content: prost Content decode failed: {e}");
+            e
+        })
+        .ok()?;
 
-    if let Some(dm_bytes) = content.data_message_bytes.as_deref() {
-        // v0.1 surfaces just the body + timestamp; richer DataMessage fields
-        // (attachments, mentions, etc.) land in a future release.
-        let body = decode_data_message_body(dm_bytes);
-        let timestamp = wire.timestamp.unwrap_or(0);
-        let source = wire.source_service_id.clone().unwrap_or_default();
-        let dm = DataMessage { body, timestamp };
-        return Some(Envelope::DataMessage {
-            source,
-            timestamp,
-            message: dm,
-        });
+    match content.content? {
+        proto::content::Content::DataMessage(dm) => {
+            let timestamp = wire.client_timestamp.unwrap_or(0);
+            let source = wire.source_service_id.clone().unwrap_or_default();
+            let message = PubDataMessage {
+                body: dm.body,
+                timestamp,
+            };
+            Some(Envelope::DataMessage {
+                source,
+                timestamp,
+                message,
+            })
+        }
+        proto::content::Content::SyncMessage(sm) => {
+            let proto::sync_message::Content::Sent(sent) = sm.content? else {
+                return None;
+            };
+            let destination = sent.destination_service_id.unwrap_or_default();
+            let timestamp = sent.timestamp.unwrap_or(0);
+            let body = sent.message.and_then(|m| m.body);
+            let message = PubDataMessage { body, timestamp };
+            Some(Envelope::SyncMessage(PubSyncMessage::Sent {
+                destination,
+                timestamp,
+                message,
+            }))
+        }
+        other => {
+            trace!("decode_content: dropping unhandled Content variant {other:?}");
+            None
+        }
     }
-
-    if let Some(sm_bytes) = content.sync_message_bytes.as_deref()
-        && let Some(sent) = decode_sync_sent(sm_bytes)
-    {
-        let dm = DataMessage {
-            body: sent.body,
-            timestamp: sent.timestamp,
-        };
-        return Some(Envelope::SyncMessage(SyncMessage::Sent {
-            destination: sent.destination,
-            timestamp: sent.timestamp,
-            message: dm,
-        }));
-    }
-
-    None
-}
-
-/// The relevant slice of Signal's `Content` protobuf for v0.1: the bytes
-/// of `data_message` and `sync_message`, decoded lazily by their callers.
-#[derive(prost::Message)]
-struct TopLevelContent {
-    #[prost(bytes, optional, tag = "1")]
-    data_message_bytes: Option<Vec<u8>>,
-    #[prost(bytes, optional, tag = "2")]
-    sync_message_bytes: Option<Vec<u8>>,
-}
-
-fn decode_top_level_content(bytes: &[u8]) -> Option<TopLevelContent> {
-    trace!("decode_top_level_content: bytes_len={}", bytes.len());
-    use prost::Message as _;
-    TopLevelContent::decode(bytes).ok()
-}
-
-/// Best-effort: pull the `body` field out of a serialized DataMessage. We
-/// avoid vendoring the full DataMessage proto by reaching for prost's
-/// Message::merge on a minimal shape; failures fall back to empty.
-fn decode_data_message_body(bytes: &[u8]) -> Option<String> {
-    trace!("decode_data_message_body: bytes_len={}", bytes.len());
-    #[derive(prost::Message)]
-    struct MinimalDataMessage {
-        #[prost(string, optional, tag = "1")]
-        body: Option<String>,
-    }
-    MinimalDataMessage::decode(bytes).ok().and_then(|m| m.body)
-}
-
-struct SentSlice {
-    destination: String,
-    timestamp: u64,
-    body: Option<String>,
-}
-
-/// Best-effort: pull `destination_service_id`, `timestamp`, and
-/// `message.body` out of a serialized SyncMessage's `sent` field. The
-/// shape Signal uses is `SyncMessage { sent: Sent { destination, timestamp,
-/// message: DataMessage { body, ... } } }`.
-fn decode_sync_sent(bytes: &[u8]) -> Option<SentSlice> {
-    trace!("decode_sync_sent: bytes_len={}", bytes.len());
-    #[derive(prost::Message)]
-    struct MinimalSent {
-        #[prost(string, optional, tag = "7")]
-        destination_service_id: Option<String>,
-        #[prost(uint64, optional, tag = "2")]
-        timestamp: Option<u64>,
-        #[prost(bytes, optional, tag = "1")]
-        message: Option<Vec<u8>>,
-    }
-    #[derive(prost::Message)]
-    struct MinimalSyncMessage {
-        #[prost(bytes, optional, tag = "1")]
-        sent: Option<Vec<u8>>,
-    }
-    let sm = MinimalSyncMessage::decode(bytes).ok()?;
-    let sent_bytes = sm.sent?;
-    let sent = MinimalSent::decode(sent_bytes.as_slice()).ok()?;
-    let destination = sent.destination_service_id.unwrap_or_default();
-    let timestamp = sent.timestamp.unwrap_or(0);
-    let body = sent.message.as_deref().and_then(decode_data_message_body);
-    Some(SentSlice {
-        destination,
-        timestamp,
-        body,
-    })
 }
 
 #[allow(dead_code)]
@@ -1078,32 +1023,22 @@ impl Client {
 /// Build the inner Content protobuf for a 1:1 send: a DataMessage with
 /// the body and timestamp, wrapped in the top-level Content.
 fn build_one_to_one_content(body: &str, timestamp: u64) -> Vec<u8> {
+    use prost::Message as _;
+
     debug!(
         "build_one_to_one_content: body_len={} timestamp={}",
         body.len(),
         timestamp
     );
-    use prost::Message as _;
 
-    #[derive(prost::Message)]
-    struct MinimalDataMessage {
-        #[prost(string, optional, tag = "1")]
-        body: Option<String>,
-        #[prost(uint64, optional, tag = "3")]
-        timestamp: Option<u64>,
-    }
-    #[derive(prost::Message)]
-    struct MinimalContent {
-        #[prost(bytes, optional, tag = "1")]
-        data_message: Option<Vec<u8>>,
-    }
-
-    let dm = MinimalDataMessage {
+    let dm = proto::DataMessage {
         body: Some(body.to_string()),
         timestamp: Some(timestamp),
+        ..Default::default()
     };
-    let content = MinimalContent {
-        data_message: Some(dm.encode_to_vec()),
+    let content = proto::Content {
+        content: Some(proto::content::Content::DataMessage(dm)),
+        ..Default::default()
     };
     content.encode_to_vec()
 }
@@ -1112,55 +1047,33 @@ fn build_one_to_one_content(body: &str, timestamp: u64) -> Vec<u8> {
 /// body as a DataMessage and tags it via SyncMessage::Sent so the
 /// receiver-side filter (`destination == own_number`) fires.
 fn build_sync_self_content(body: &str, own_destination: &str, timestamp: u64) -> Vec<u8> {
+    use prost::Message as _;
+
     debug!(
         "build_sync_self_content: body_len={} own_destination={} timestamp={}",
         body.len(),
         own_destination,
         timestamp
     );
-    use prost::Message as _;
 
-    #[derive(prost::Message)]
-    struct MinimalDataMessage {
-        #[prost(string, optional, tag = "1")]
-        body: Option<String>,
-        #[prost(uint64, optional, tag = "3")]
-        timestamp: Option<u64>,
-    }
-    #[derive(prost::Message)]
-    struct MinimalSent {
-        #[prost(string, optional, tag = "7")]
-        destination_service_id: Option<String>,
-        #[prost(uint64, optional, tag = "2")]
-        timestamp: Option<u64>,
-        #[prost(bytes, optional, tag = "1")]
-        message: Option<Vec<u8>>,
-    }
-    #[derive(prost::Message)]
-    struct MinimalSyncMessage {
-        #[prost(bytes, optional, tag = "1")]
-        sent: Option<Vec<u8>>,
-    }
-    #[derive(prost::Message)]
-    struct MinimalContent {
-        #[prost(bytes, optional, tag = "2")]
-        sync_message: Option<Vec<u8>>,
-    }
-
-    let dm = MinimalDataMessage {
+    let dm = proto::DataMessage {
         body: Some(body.to_string()),
         timestamp: Some(timestamp),
+        ..Default::default()
     };
-    let sent = MinimalSent {
+    let sent = proto::sync_message::Sent {
         destination_service_id: Some(own_destination.to_string()),
         timestamp: Some(timestamp),
-        message: Some(dm.encode_to_vec()),
+        message: Some(dm),
+        ..Default::default()
     };
-    let sm = MinimalSyncMessage {
-        sent: Some(sent.encode_to_vec()),
+    let sm = proto::SyncMessage {
+        content: Some(proto::sync_message::Content::Sent(sent)),
+        ..Default::default()
     };
-    let content = MinimalContent {
-        sync_message: Some(sm.encode_to_vec()),
+    let content = proto::Content {
+        content: Some(proto::content::Content::SyncMessage(sm)),
+        ..Default::default()
     };
     content.encode_to_vec()
 }

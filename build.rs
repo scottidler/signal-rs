@@ -17,14 +17,18 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/");
 
-    // Generate Rust types from vendored .proto files. Signal-Android's
-    // libsignal-service is the canonical source; libsignal-rust does not
-    // export these protobufs. Phase 2 verification settled on vendoring
-    // rather than tracking an unstable upstream re-export path.
+    // Generate Rust types from vendored .proto files. The canonical
+    // source is the Turasa fork of libsignal-service-java at the tag
+    // signal-cli pins via signalnetwork; the upstream signalapp repo is
+    // archived. libsignal-rust does not export these protobufs, so we
+    // vendor them. service.proto is the full SignalService surface
+    // (Envelope, Content, DataMessage, SyncMessage, etc.); it supersedes
+    // the earlier minimal envelope.proto stub. provisioning.proto stays
+    // separate (different message scope).
     println!("cargo:rerun-if-changed=src/proto/provisioning.proto");
-    println!("cargo:rerun-if-changed=src/proto/envelope.proto");
+    println!("cargo:rerun-if-changed=src/proto/service.proto");
     prost_build::compile_protos(
-        &["src/proto/provisioning.proto", "src/proto/envelope.proto"],
+        &["src/proto/provisioning.proto", "src/proto/service.proto"],
         &["src/proto/"],
     )
     .expect("failed to compile vendored protos");
