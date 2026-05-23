@@ -19,6 +19,7 @@
 //! - [`crypto`] - the ProvisioningCipher port + prekey helpers.
 
 pub mod api;
+pub mod attachment;
 pub mod client;
 pub mod config;
 pub mod crypto;

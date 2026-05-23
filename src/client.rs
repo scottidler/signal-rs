@@ -391,6 +391,19 @@ impl Client {
         result
     }
 
+    /// Fetch and decrypt a CDN-hosted attachment referenced by an
+    /// [`AttachmentPointer`] (pulled off an inbound `Envelope::DataMessage`
+    /// or `SyncMessage::Sent`). Verifies HMAC + SHA-256 digest before
+    /// writing plaintext to `dest`. See [`crate::attachment::download_attachment`]
+    /// for the cipher format details.
+    pub async fn download_attachment(
+        &self,
+        pointer: &crate::envelope::AttachmentPointer,
+        dest: &Path,
+    ) -> Result<(), crate::attachment::AttachmentError> {
+        crate::attachment::download_attachment(pointer, dest).await
+    }
+
     /// Encrypt a Note-to-Self transcript to each of the user's OTHER
     /// linked devices and dispatch via `send_sync_message`. The chat
     /// server fans the encrypted blobs to those devices; the user's

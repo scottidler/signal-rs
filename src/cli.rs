@@ -71,4 +71,32 @@ pub enum Command {
         #[arg(long)]
         once: bool,
     },
+
+    /// Download and decrypt an attachment from Signal's CDN. The pointer
+    /// fields come from a prior received `Envelope::DataMessage` (or
+    /// `SyncMessage::Sent`); pass them through to this subcommand. Either
+    /// `--cdn-id` (cdn0) or `--cdn-key` (cdn2/cdn3) is required depending
+    /// on the cdn_number the pointer reported.
+    Download {
+        /// cdn_id from the attachment pointer (used when cdn_number == 0).
+        #[arg(long, default_value_t = 0)]
+        cdn_id: u64,
+        /// cdn_key from the attachment pointer (used when cdn_number == 2 or 3).
+        #[arg(long)]
+        cdn_key: Option<String>,
+        /// cdn_number from the attachment pointer: 0, 2, or 3.
+        #[arg(long)]
+        cdn_number: u32,
+        /// 64-byte attachment key, base64-encoded.
+        #[arg(long)]
+        key: String,
+        /// 32-byte SHA-256 digest of the encrypted blob, base64-encoded.
+        /// Pass empty string to skip digest verification (HMAC is still
+        /// enforced).
+        #[arg(long, default_value = "")]
+        digest: String,
+        /// Output path for the decrypted plaintext.
+        #[arg(long)]
+        dest: PathBuf,
+    },
 }

@@ -9,7 +9,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use signal_rs::{Client, link::link};
+use base64::Engine;
+use signal_rs::{Client, attachment, envelope::AttachmentPointer, link::link};
 
 mod cli;
 use cli::{Cli, Command};
@@ -177,6 +178,57 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            Ok(())
+        }
+        Command::Download {
+            cdn_id,
+            cdn_key,
+            cdn_number,
+            key,
+            digest,
+            dest,
+        } => {
+            info!(
+                "download: cdn_id={cdn_id} cdn_key={:?} cdn_number={cdn_number} dest={}",
+                cdn_key,
+                dest.display()
+            );
+            let key_bytes = base64::engine::general_purpose::STANDARD
+                .decode(key.as_bytes())
+                .map_err(|e| eyre!("--key base64 decode: {e}"))?;
+            let digest_bytes = if digest.is_empty() {
+                Vec::new()
+            } else {
+                base64::engine::general_purpose::STANDARD
+                    .decode(digest.as_bytes())
+                    .map_err(|e| eyre!("--digest base64 decode: {e}"))?
+            };
+            let pointer = AttachmentPointer {
+                cdn_id,
+                cdn_key,
+                cdn_number,
+                content_type: None,
+                size: None,
+                digest: digest_bytes,
+                key: key_bytes,
+                file_name: None,
+                caption: None,
+                width: None,
+                height: None,
+                voice_note: false,
+                borderless: false,
+                gif: false,
+                upload_timestamp: None,
+                blurhash: None,
+            };
+            attachment::download_attachment(&pointer, &dest)
+                .await
+                .map_err(|e| eyre!("download_attachment: {e}"))?;
+            println!(
+                "download: {} bytes written to {}",
+                std::fs::metadata(&dest)?.len(),
+                dest.display()
+            );
             Ok(())
         }
     }
