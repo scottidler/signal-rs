@@ -8,6 +8,7 @@
 
 pub mod prekeys;
 pub mod provisioning;
+pub mod sealed;
 
 pub use prekeys::{
     GeneratedBatch, IdentityKind, PrekeyError, generate_batch, generate_upload_persist, persist_batch, upload_batch,

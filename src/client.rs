@@ -10,7 +10,8 @@ use std::time::Duration;
 use libsignal_net::chat::server_requests::ServerEvent;
 use libsignal_net::chat::{AuthenticatedChatHeaders, ChatConnection, LanguageList, ReceiveStories};
 use libsignal_protocol::{
-    Aci, CiphertextMessage, DeviceId, PreKeySignalMessage, ProtocolAddress, SessionStore, SignalMessage,
+    Aci, CiphertextMessage, CiphertextMessageType, DeviceId, PreKeySignalMessage, ProtocolAddress, SessionStore,
+    SignalMessage,
 };
 use log::{debug, info, trace, warn};
 use prost::Message as _;
@@ -740,29 +741,10 @@ impl Client {
             }
         };
 
-        let ciphertext = match envelope_type {
-            proto::envelope::Type::DoubleRatchet => CiphertextMessage::SignalMessage(SignalMessage::try_from(content)?),
-            proto::envelope::Type::PrekeyMessage => {
-                CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::try_from(content)?)
-            }
-            other => {
-                debug!("process_envelope: ignoring envelope type {other:?} for v0.1");
-                return Ok(None);
-            }
-        };
-
-        let source_service_id = wire
-            .source_service_id
-            .as_deref()
-            .ok_or(ReceiveError::MissingCredential("source_service_id"))?;
-        let source_device = wire.source_device_id.unwrap_or(1);
-        let remote_address = ProtocolAddress::new(source_service_id.to_string(), device_id_from_u32(source_device)?);
-
-        // Route by envelope.destination_service_id (wire tag 13). The
-        // server sets this field on every delivery; PNI-addressed
-        // envelopes go to PNI-scoped stores so libsignal asks for the
-        // PNI keypair / reg id / prekey rows. Unknown or missing
-        // destination defaults to ACI (legacy compatibility).
+        // Both unsealed and sealed sender paths route by the wire's
+        // `destination_service_id` (tag 13) and need the local
+        // ProtocolAddress + scoped stores. Compute up front; both
+        // branches consume them.
         let local_aci = self
             .inner
             .store
@@ -772,7 +754,8 @@ impl Client {
         let local_pni = self.inner.store.get_pni().await?;
         let (identity_kind, local_service_id) =
             route_envelope_to_identity(wire.destination_service_id.as_deref(), &local_aci, local_pni.as_deref());
-        let local_address = ProtocolAddress::new(local_service_id, device_id_from_u32(self.inner.identity.device_id)?);
+        let local_device_id = device_id_from_u32(self.inner.identity.device_id)?;
+        let local_address = ProtocolAddress::new(local_service_id.clone(), local_device_id);
         debug!(
             "process_envelope: routed identity_kind={:?} local_address={}",
             identity_kind, local_address
@@ -786,6 +769,82 @@ impl Client {
         let mut pre_key = tx_store.pre_key_store(identity_kind);
         let signed_pre_key = tx_store.signed_pre_key_store(identity_kind);
         let mut kyber = tx_store.kyber_pre_key_store(identity_kind);
+
+        // Returns (source_service_id, ciphertext_for_decrypt, remote_address)
+        // for both unsealed and sealed paths. The sealed path additionally
+        // performs USMC unwrap + trust-root validation + self-send check
+        // before reaching message_decrypt.
+        let decrypt_inputs = match envelope_type {
+            proto::envelope::Type::DoubleRatchet | proto::envelope::Type::PrekeyMessage => {
+                let ciphertext = match envelope_type {
+                    proto::envelope::Type::DoubleRatchet => {
+                        CiphertextMessage::SignalMessage(SignalMessage::try_from(content)?)
+                    }
+                    proto::envelope::Type::PrekeyMessage => {
+                        CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::try_from(content)?)
+                    }
+                    _ => unreachable!("outer arm restricts to these two variants"),
+                };
+                let source_service_id = wire
+                    .source_service_id
+                    .as_deref()
+                    .ok_or(ReceiveError::MissingCredential("source_service_id"))?
+                    .to_string();
+                let source_device = wire.source_device_id.unwrap_or(1);
+                let remote_address =
+                    ProtocolAddress::new(source_service_id.clone(), device_id_from_u32(source_device)?);
+                Some((source_service_id, ciphertext, remote_address))
+            }
+            proto::envelope::Type::UnidentifiedSender => {
+                debug!("process_envelope: UNIDENTIFIED_SENDER envelope; unwrapping USMC");
+                let usmc = libsignal_protocol::sealed_sender_decrypt_to_usmc(content, &identity).await?;
+
+                let validation_time = libsignal_protocol::Timestamp::from_epoch_millis(now_millis());
+                crate::crypto::sealed::validate_against_trust_roots(
+                    usmc.sender()?,
+                    crate::crypto::sealed::production_trust_roots(),
+                    validation_time,
+                )?;
+
+                let sender_cert = usmc.sender()?;
+                let sender_uuid = sender_cert.sender_uuid()?.to_string();
+                let sender_device_id = sender_cert.sender_device_id()?;
+
+                // Self-send guard: libsignal's high-level sealed_sender_decrypt
+                // returns SealedSenderSelfSend in this case. Mirror that by
+                // dropping the envelope rather than reprocessing our own message.
+                if sender_uuid == local_service_id && sender_device_id == local_device_id {
+                    debug!(
+                        "process_envelope: sealed-sender self-send (sender_uuid={} device_id={}); dropping",
+                        sender_uuid, sender_device_id
+                    );
+                    return Ok(None);
+                }
+
+                let inner_ciphertext = match usmc.msg_type()? {
+                    CiphertextMessageType::Whisper => {
+                        CiphertextMessage::SignalMessage(SignalMessage::try_from(usmc.contents()?)?)
+                    }
+                    CiphertextMessageType::PreKey => {
+                        CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::try_from(usmc.contents()?)?)
+                    }
+                    other => {
+                        warn!("process_envelope: sealed-sender inner msg_type {other:?} not supported in v1; dropping");
+                        return Ok(None);
+                    }
+                };
+                let remote_address = ProtocolAddress::new(sender_uuid.clone(), sender_device_id);
+                Some((sender_uuid, inner_ciphertext, remote_address))
+            }
+            other => {
+                debug!("process_envelope: ignoring envelope type {other:?} for v0.1");
+                None
+            }
+        };
+
+        let Some((source_service_id, ciphertext, remote_address)) = decrypt_inputs else {
+            return Ok(None);
+        };
 
         let plaintext = libsignal_protocol::message_decrypt(
             &ciphertext,
@@ -807,7 +866,8 @@ impl Client {
         drop(kyber);
         tx_store.commit().await.map_err(StoreError::from)?;
 
-        let decoded = decode_content(&plaintext, &wire);
+        let timestamp = wire.client_timestamp.unwrap_or(0);
+        let decoded = decode_content(&plaintext, &source_service_id, timestamp);
         Ok(decoded)
     }
 }
@@ -863,14 +923,21 @@ pub(crate) fn route_envelope_to_identity(
 /// (replaces the earlier hand-rolled minimal decoders). v0.1 surfaces
 /// DataMessage and SyncMessage::Sent; receipts/typing/edit are stubbed
 /// and dropped here for Phase 1 (Phase 3 maps them onto the public enum).
-fn decode_content(plaintext: &[u8], wire: &proto::Envelope) -> Option<Envelope> {
+///
+/// `source` and `timestamp` are supplied by the caller because sealed-sender
+/// envelopes carry sender identity inside the encrypted USMC (no plaintext
+/// `source_service_id` on the wire). The unsealed path reads them from the
+/// wire envelope's `source_service_id` and `client_timestamp`; the sealed
+/// path reads them from the validated `SenderCertificate`.
+fn decode_content(plaintext: &[u8], source: &str, timestamp: u64) -> Option<Envelope> {
     use crate::envelope::{DataMessage as PubDataMessage, SyncMessage as PubSyncMessage};
     use prost::Message as _;
 
     debug!(
-        "decode_content: plaintext_len={} envelope_type={:?}",
+        "decode_content: plaintext_len={} source={} timestamp={}",
         plaintext.len(),
-        wire.r#type()
+        source,
+        timestamp
     );
 
     let content = proto::Content::decode(plaintext)
@@ -882,14 +949,12 @@ fn decode_content(plaintext: &[u8], wire: &proto::Envelope) -> Option<Envelope> 
 
     match content.content? {
         proto::content::Content::DataMessage(dm) => {
-            let timestamp = wire.client_timestamp.unwrap_or(0);
-            let source = wire.source_service_id.clone().unwrap_or_default();
             let message = PubDataMessage {
                 body: dm.body,
                 timestamp,
             };
             Some(Envelope::DataMessage {
-                source,
+                source: source.to_string(),
                 timestamp,
                 message,
             })
@@ -899,12 +964,15 @@ fn decode_content(plaintext: &[u8], wire: &proto::Envelope) -> Option<Envelope> 
                 return None;
             };
             let destination = sent.destination_service_id.unwrap_or_default();
-            let timestamp = sent.timestamp.unwrap_or(0);
+            let sync_timestamp = sent.timestamp.unwrap_or(timestamp);
             let body = sent.message.and_then(|m| m.body);
-            let message = PubDataMessage { body, timestamp };
+            let message = PubDataMessage {
+                body,
+                timestamp: sync_timestamp,
+            };
             Some(Envelope::SyncMessage(PubSyncMessage::Sent {
                 destination,
-                timestamp,
+                timestamp: sync_timestamp,
                 message,
             }))
         }

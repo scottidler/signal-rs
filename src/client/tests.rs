@@ -195,22 +195,13 @@ fn route_aci_destination_works_without_local_pni() {
 use crate::client::{build_one_to_one_content, build_sync_self_content, decode_content};
 use crate::crypto::provisioning::proto;
 
-fn wire_envelope(source_service_id: &str, client_timestamp: u64) -> proto::Envelope {
-    proto::Envelope {
-        source_service_id: Some(source_service_id.to_string()),
-        client_timestamp: Some(client_timestamp),
-        ..Default::default()
-    }
-}
-
 #[test]
 fn decode_content_data_message_round_trips_through_build_one_to_one() {
     let body = "hello from a peer";
     let ts = 1_700_000_000_123_u64;
     let plaintext = build_one_to_one_content(body, ts);
-    let wire = wire_envelope(ACI, ts);
 
-    let env = decode_content(&plaintext, &wire).expect("DataMessage Content decodes");
+    let env = decode_content(&plaintext, ACI, ts).expect("DataMessage Content decodes");
     let crate::envelope::Envelope::DataMessage {
         source,
         timestamp,
@@ -222,9 +213,6 @@ fn decode_content_data_message_round_trips_through_build_one_to_one() {
     assert_eq!(source, ACI);
     assert_eq!(timestamp, ts);
     assert_eq!(message.body.as_deref(), Some(body));
-    // The public DataMessage timestamp comes from the wire envelope, not
-    // the inner DataMessage.timestamp; both happen to match here because
-    // the builder uses the same value.
     assert_eq!(message.timestamp, ts);
 }
 
@@ -234,12 +222,11 @@ fn decode_content_sync_sent_round_trips_through_build_sync_self() {
     let own = "+15555550100";
     let ts = 1_700_000_000_456_u64;
     let plaintext = build_sync_self_content(body, own, ts);
-    // Wire envelope source_service_id is the primary's service-id; the
-    // public SyncMessage::Sent.destination comes from the SyncMessage
-    // payload, not the wire envelope.
-    let wire = wire_envelope(ACI, ts);
-
-    let env = decode_content(&plaintext, &wire).expect("SyncMessage Content decodes");
+    // Wire-envelope source is the primary's service-id; the public
+    // SyncMessage::Sent.destination comes from the SyncMessage payload,
+    // not the wire envelope. Pass ACI as the source so we can confirm
+    // it is NOT what populates `destination`.
+    let env = decode_content(&plaintext, ACI, ts).expect("SyncMessage Content decodes");
     let crate::envelope::Envelope::SyncMessage(crate::envelope::SyncMessage::Sent {
         destination,
         timestamp,
@@ -270,9 +257,7 @@ fn decode_content_drops_unhandled_variants() {
         ..Default::default()
     };
     let plaintext = content.encode_to_vec();
-    let wire = wire_envelope(ACI, 1_700_000_000_789);
-
-    assert!(decode_content(&plaintext, &wire).is_none());
+    assert!(decode_content(&plaintext, ACI, 1_700_000_000_789).is_none());
 }
 
 #[test]
@@ -282,13 +267,11 @@ fn decode_content_returns_none_for_empty_content() {
     // SyncMessage from nothing.
     use prost::Message as _;
     let plaintext = proto::Content::default().encode_to_vec();
-    let wire = wire_envelope(ACI, 1_700_000_000);
-    assert!(decode_content(&plaintext, &wire).is_none());
+    assert!(decode_content(&plaintext, ACI, 1_700_000_000).is_none());
 }
 
 #[test]
 fn decode_content_returns_none_on_undecodable_bytes() {
     let plaintext = b"this is not a valid protobuf";
-    let wire = wire_envelope(ACI, 0);
-    assert!(decode_content(plaintext, &wire).is_none());
+    assert!(decode_content(plaintext, ACI, 0).is_none());
 }

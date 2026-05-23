@@ -532,31 +532,53 @@ worse than it found it.
      identity_store).await?` to get a
      `UnidentifiedSenderMessageContent` (USMC) without validating
      the trust root.
-  2. Pull `usmc.sender()?` to get the
-     `SenderCertificate`. Validate it against the multi-root array
-     using `usmc.sender()?.validate(&root, timestamp)` (or whatever
-     the libsignal-protocol signature actually exposes for
-     multi-root validation; verify the exact symbol in
-     `rust/protocol/src/sealed_sender.rs` during Phase 2's first
-     hour and adjust). Iterate over `TRUST_ROOTS`; succeed if any
-     root validates.
-  3. Decrypt the inner `usmc.contents()?` payload via the regular
-     `message_decrypt` path scoped to the destination identity (so
-     it consumes ACI prekeys for ACI-destined sealed envelopes and
-     PNI prekeys for PNI-destined sealed envelopes).
-  4. Surface the result as `Envelope::DataMessage { source:
-     Recipient::Aci(usmc.sender()?.sender_uuid()?), source_device:
-     usmc.sender()?.sender_device_id()?.into(), ... }`.
+  2. Pull `usmc.sender()?` to get the `SenderCertificate`. Validate
+     it against ALL configured trust roots in one call using
+     `SenderCertificate::validate_with_trust_roots(&[&r1, &r2],
+     validation_time)` (verified in
+     `libsignal/rust/protocol/src/sealed_sender.rs:331`). This is
+     strictly safer than the iterate-and-short-circuit pattern the
+     original draft sketched: libsignal's implementation walks every
+     root in constant time via `subtle::Choice` to hide which root
+     matched. Wrap the call in
+     `crate::crypto::sealed::validate_against_trust_roots` so the
+     decision is unit-testable independently of `process_envelope`.
+  3. Self-send guard: if `sender_cert.sender_uuid() == local_service_id`
+     and `sender_cert.sender_device_id() == local_device_id`, drop
+     the envelope. This mirrors libsignal's high-level
+     `SealedSenderSelfSend` return.
+  4. Decrypt the inner `usmc.contents()?` payload via the same
+     `libsignal_protocol::message_decrypt` path the unsealed branch
+     uses, scoped to the destination identity (so it consumes ACI
+     prekeys for ACI-destined sealed envelopes and PNI prekeys for
+     PNI-destined sealed envelopes). Construct the inner
+     `CiphertextMessage` from `usmc.msg_type()`:
+     - `Whisper` -> `SignalMessage::try_from(usmc.contents()?)`
+     - `PreKey`  -> `PreKeySignalMessage::try_from(usmc.contents()?)`
+     - other -> warn + drop.
+  5. Surface the result through the same `decode_content(plaintext,
+     source, timestamp)` path the unsealed branch uses, passing
+     `source = usmc.sender()?.sender_uuid()?` and
+     `timestamp = wire.client_timestamp`. (The decoder was refactored
+     to take source+timestamp as parameters in Phase 2 prep for
+     exactly this reason; sealed envelopes carry no plaintext source
+     on the wire.)
 - Acceptance: send a 1:1 message from a non-primary peer (not the
   same phone) to our account via Signal app. Today's behaviour is
   silent drop (envelope skipped). After this phase, the message
   appears on stdout.
-- Test: synthetic sealed-sender envelope decode in a new
-  `process_envelope` unit test, similar to the existing
-  `route_envelope_to_identity` coverage. The test must exercise
-  BOTH trust roots: validate against root #1 with root #2
-  configured first, and vice versa, to confirm the multi-root
-  iteration works.
+- Test: the multi-root validation lives in a pure helper
+  (`crate::crypto::sealed::validate_against_trust_roots`); unit
+  tests in `src/crypto/sealed/tests.rs` exercise BOTH trust roots
+  (cert signed by root #1, cert signed by root #2) under BOTH
+  orderings (roots listed [a, b] and [b, a]), to confirm the
+  multi-root acceptance is order-independent. A
+  `process_envelope`-level sealed-sender test would require full
+  linked state + peer-prekey fixturing; following the precedent set
+  by `route_envelope_to_identity` (extracted as a pure function for
+  the same reason; see `src/client/tests.rs` comment), the multi-
+  root concern is pinned at the helper boundary and the end-to-end
+  path is covered by Phase 10's manual smoke.
 
 #### Phase 3: Rich Envelope mapping (Receipt, Typing, Edit)
 **Model:** sonnet
