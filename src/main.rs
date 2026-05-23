@@ -9,7 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use signal_rs::{Client, link::prepare_link_session};
+use signal_rs::{Client, link::link};
 
 mod cli;
 use cli::{Cli, Command};
@@ -59,17 +59,30 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Link { name } => {
             info!("link: state_dir={} name={name}", state_dir.display());
-            // The post-decrypt half of linking is reachable through
-            // signal_rs::link::finalize_link once a consumer drives the
-            // provisioning WebSocket themselves. For the CLI, we surface
-            // the v0.1 stub clearly.
-            let mut rng = rand::rng();
-            let (_, uri) = prepare_link_session(&mut rng, "<server-issued-address>");
-            println!("Provisioning URI scaffolding (Phase 10 will replace this with real server-issued address):");
-            println!("{uri}");
-            println!();
-            println!("error: live linking is Phase 10 manual smoke test (libsignal-net's ProvisioningConnection)");
-            Err(eyre!("LinkError::LiveServerNotImplemented"))
+            // Live linking against Signal. Renders the provisioning URI
+            // as a QR code so the operator can scan it from their primary
+            // device's Linked Devices screen.
+            let outcome = link(&state_dir, &name, |uri| {
+                println!();
+                println!("Scan this with your primary device (Settings -> Linked Devices):");
+                println!();
+                if let Ok(code) = qrcode::QrCode::new(uri.as_bytes()) {
+                    let rendered = code
+                        .render::<qrcode::render::unicode::Dense1x2>()
+                        .quiet_zone(true)
+                        .build();
+                    println!("{rendered}");
+                }
+                println!("Or manually copy: {uri}");
+                println!();
+            })
+            .await
+            .map_err(|e| eyre!("link: {e}"))?;
+            println!(
+                "linked: account={} device_id={}",
+                outcome.account_number, outcome.device_id
+            );
+            Ok(())
         }
         Command::Send { target, message } => {
             info!("send: target={target} body_len={}", message.len());
@@ -78,15 +91,38 @@ async fn main() -> Result<()> {
                 .send(&target, &message)
                 .await
                 .map_err(|e| eyre!("Client::send: {e}"))?;
+            println!("send: dispatched to {target}");
             Ok(())
         }
         Command::Receive { once } => {
             info!("receive: state_dir={} once={once}", state_dir.display());
             let client = Client::open(&state_dir).await.map_err(|e| eyre!("Client::open: {e}"))?;
-            client
-                .run_receive_loop()
-                .await
-                .map_err(|e| eyre!("Client::run_receive_loop: {e}"))?;
+            if once {
+                // --once: race the receive loop against the first
+                // broadcast envelope; drop the loop future as soon as we
+                // print one. libsignal-protocol's storage futures are
+                // !Send so we cannot tokio::spawn the loop; tokio::select!
+                // co-runs both futures on the same task.
+                let mut rx = client.receive();
+                let loop_fut = client.run_receive_loop();
+                tokio::pin!(loop_fut);
+                tokio::select! {
+                    msg = rx.recv() => {
+                        match msg {
+                            Ok(envelope) => println!("{envelope:#?}"),
+                            Err(e) => eprintln!("receive: channel closed before first envelope: {e}"),
+                        }
+                    }
+                    res = &mut loop_fut => {
+                        res.map_err(|e| eyre!("run_receive_loop: {e}"))?;
+                    }
+                }
+            } else {
+                client
+                    .run_receive_loop()
+                    .await
+                    .map_err(|e| eyre!("Client::run_receive_loop: {e}"))?;
+            }
             Ok(())
         }
     }
