@@ -287,7 +287,8 @@ impl Client {
         let tx = pool.begin().await.map_err(StoreError::from)?;
         let tx_store = crate::storage::tx::TxStore::new(tx);
         let mut session = tx_store.session_store();
-        let mut identity = tx_store.identity_store();
+        // Send paths operate AS our ACI identity.
+        let mut identity = tx_store.identity_store(crate::crypto::prekeys::IdentityKind::Aci);
         let mut outbound: Vec<SingleOutboundUnsealedMessage<CiphertextMessage>> = Vec::new();
 
         if let Some(bundles) = bundles_to_process {
@@ -497,7 +498,8 @@ impl Client {
         let tx = pool.begin().await.map_err(StoreError::from)?;
         let tx_store = crate::storage::tx::TxStore::new(tx);
         let mut session = tx_store.session_store();
-        let mut identity = tx_store.identity_store();
+        // Send paths operate AS our ACI identity.
+        let mut identity = tx_store.identity_store(crate::crypto::prekeys::IdentityKind::Aci);
         let mut outbound: Vec<SingleOutboundUnsealedMessage<CiphertextMessage>> = Vec::new();
 
         if let Some(bundles) = bundles_to_process {
@@ -614,14 +616,6 @@ impl Client {
         let (chat, mut events) = self.open_authenticated_chat().await?;
         debug!("run_receive_loop: authenticated chat connected, entering event loop");
 
-        let local_aci = self
-            .inner
-            .store
-            .get_aci()
-            .await?
-            .ok_or(ReceiveError::MissingCredential("aci"))?;
-        let local_address = ProtocolAddress::new(local_aci.clone(), device_id_from_u32(self.inner.identity.device_id)?);
-
         while let Some(raw) = events.recv().await {
             let event = match ServerEvent::try_from(raw) {
                 Ok(e) => e,
@@ -651,7 +645,7 @@ impl Client {
                     return Err(ReceiveError::Stopped(msg));
                 }
                 ServerEvent::IncomingMessage { envelope, send_ack, .. } => {
-                    match self.process_envelope(&envelope, &local_address).await {
+                    match self.process_envelope(&envelope).await {
                         Ok(Some(decoded)) => {
                             let _ = self.inner.receive_tx.send(decoded);
                             let _ = send_ack(http::StatusCode::OK);
@@ -729,16 +723,9 @@ impl Client {
     /// - Decrypt failures (Bad MAC, unknown prekey, identity mismatch)
     ///   return Err here and the receive loop logs WARN and drops the
     ///   envelope without disconnecting.
-    async fn process_envelope(
-        &self,
-        envelope_bytes: &[u8],
-        local_address: &ProtocolAddress,
-    ) -> Result<Option<Envelope>, ReceiveError> {
-        debug!(
-            "process_envelope: envelope_len={} local_address={}",
-            envelope_bytes.len(),
-            local_address
-        );
+    async fn process_envelope(&self, envelope_bytes: &[u8]) -> Result<Option<Envelope>, ReceiveError> {
+        use crate::crypto::prekeys::IdentityKind;
+        debug!("process_envelope: envelope_len={}", envelope_bytes.len());
         let wire = proto::Envelope::decode(envelope_bytes).map_err(|e| {
             ReceiveError::Signal(libsignal_protocol::SignalProtocolError::InvalidArgument(format!(
                 "envelope decode: {e}"
@@ -772,19 +759,53 @@ impl Client {
         let source_device = wire.source_device.unwrap_or(1);
         let remote_address = ProtocolAddress::new(source_service_id.to_string(), device_id_from_u32(source_device)?);
 
+        // Route by envelope.destination_service_id (wire tag 13). The
+        // server sets this field on every delivery; PNI-addressed
+        // envelopes go to PNI-scoped stores so libsignal asks for the
+        // PNI keypair / reg id / prekey rows. Unknown or missing
+        // destination defaults to ACI (legacy compatibility).
+        let local_aci = self
+            .inner
+            .store
+            .get_aci()
+            .await?
+            .ok_or(ReceiveError::MissingCredential("aci"))?;
+        let local_pni = self.inner.store.get_pni().await?;
+        let dest = wire.destination_service_id.as_deref();
+        let (identity_kind, local_service_id) = match (dest, local_pni.as_deref()) {
+            (Some(d), Some(pni)) if d == pni => (IdentityKind::Pni, d.to_string()),
+            (Some(d), _) if d == local_aci => (IdentityKind::Aci, local_aci.clone()),
+            (Some(d), _) => {
+                warn!(
+                    "process_envelope: destination_service_id={} matches neither local ACI ({}) nor PNI ({:?}); routing to ACI",
+                    d, local_aci, local_pni
+                );
+                (IdentityKind::Aci, local_aci.clone())
+            }
+            (None, _) => {
+                debug!("process_envelope: destination_service_id absent; routing to ACI");
+                (IdentityKind::Aci, local_aci.clone())
+            }
+        };
+        let local_address = ProtocolAddress::new(local_service_id, device_id_from_u32(self.inner.identity.device_id)?);
+        debug!(
+            "process_envelope: routed identity_kind={:?} local_address={}",
+            identity_kind, local_address
+        );
+
         let pool = self.inner.store.pool().clone();
         let tx = pool.begin().await.map_err(StoreError::from)?;
         let tx_store = crate::storage::tx::TxStore::new(tx);
         let mut session = tx_store.session_store();
-        let mut identity = tx_store.identity_store();
-        let mut pre_key = tx_store.pre_key_store();
-        let signed_pre_key = tx_store.signed_pre_key_store();
-        let mut kyber = tx_store.kyber_pre_key_store();
+        let mut identity = tx_store.identity_store(identity_kind);
+        let mut pre_key = tx_store.pre_key_store(identity_kind);
+        let signed_pre_key = tx_store.signed_pre_key_store(identity_kind);
+        let mut kyber = tx_store.kyber_pre_key_store(identity_kind);
 
         let plaintext = libsignal_protocol::message_decrypt(
             &ciphertext,
             &remote_address,
-            local_address,
+            &local_address,
             &mut session,
             &mut identity,
             &mut pre_key,
@@ -943,32 +964,23 @@ impl Client {
         debug!("maybe_replenish_prekeys:");
         use crate::crypto::prekeys::IdentityKind;
 
-        // Per-identity replenishment, against the SERVER's authoritative
-        // count (not local SELECT COUNT). The server is the source of
-        // truth — peers consume one-time prekeys server-side, and the
-        // local store has no way to observe that consumption until the
-        // resulting message arrives. signal-cli's
-        // PreKeyHelper.refreshPreKeysIfNecessary uses the same pattern.
-        //
-        // ACI and PNI live in disjoint local id ranges (PNI starts at
-        // PNI_ID_OFFSET == 2^23) so each identity's replenishment
-        // resumes from its own MAX. A single shared MAX would push ACI
-        // ids into the PNI range on the first refill cycle, colliding
-        // exactly the way the link path used to.
-        const PNI_ID_OFFSET: u32 = 1 << 23;
+        // Per-identity replenishment. Each identity's "next id" comes
+        // from a kind-filtered MAX(id) against the `prekeys` table;
+        // the (identity_kind, id) primary key keeps ACI and PNI rows
+        // in their own partitions. The server-authoritative count
+        // (in maybe_replenish_one_identity) decides WHETHER to refill;
+        // the local MAX(id) decides WHAT id to start the next batch at.
         let pool = self.inner.store.pool().clone();
-        let aci_max: (Option<i64>,) = sqlx::query_as("SELECT MAX(id) FROM prekeys WHERE id < ?")
-            .bind(PNI_ID_OFFSET as i64)
+        let aci_max: (Option<i64>,) = sqlx::query_as("SELECT MAX(id) FROM prekeys WHERE identity_kind = 'aci'")
             .fetch_one(&pool)
             .await
             .map_err(StoreError::from)?;
         let aci_next = aci_max.0.map(|v| v as u32).unwrap_or(0).saturating_add(1);
-        let pni_max: (Option<i64>,) = sqlx::query_as("SELECT MAX(id) FROM prekeys WHERE id >= ?")
-            .bind(PNI_ID_OFFSET as i64)
+        let pni_max: (Option<i64>,) = sqlx::query_as("SELECT MAX(id) FROM prekeys WHERE identity_kind = 'pni'")
             .fetch_one(&pool)
             .await
             .map_err(StoreError::from)?;
-        let pni_next = pni_max.0.map(|v| v as u32).unwrap_or(PNI_ID_OFFSET).saturating_add(1);
+        let pni_next = pni_max.0.map(|v| v as u32).unwrap_or(0).saturating_add(1);
 
         let mut rng = rand::rng();
         self.maybe_replenish_one_identity(IdentityKind::Aci, &mut rng, aci_next)

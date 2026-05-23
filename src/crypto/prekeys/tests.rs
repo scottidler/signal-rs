@@ -49,9 +49,9 @@ async fn generate_batch_produces_records_in_memory_only() {
     // does NOT touch the local store. The store must not yet have the
     // prekey we just generated.
     let first_id = PreKeyId::from(batch.one_time_prekey_ids[0]);
-    let s = store.clone();
+    let scoped = store.scoped(IdentityKind::Aci);
     assert!(
-        PreKeyStore::get_pre_key(&s, first_id).await.is_err(),
+        PreKeyStore::get_pre_key(&scoped, first_id).await.is_err(),
         "generate_batch must not write to the store - persist_batch does that after upload"
     );
 }
@@ -65,11 +65,11 @@ async fn persist_batch_writes_after_upload_success() {
     let store = linked_store().await;
     let mut rng = ChaCha20Rng::seed_from_u64(11);
     let batch = generate_batch(&mut rng, &store, IdentityKind::Aci, 1).await.unwrap();
-    persist_batch(&store, &batch).await.unwrap();
+    persist_batch(&store, &batch, IdentityKind::Aci).await.unwrap();
 
     let first_id = PreKeyId::from(batch.one_time_prekey_ids[0]);
-    let s = store.clone();
-    let record = PreKeyStore::get_pre_key(&s, first_id).await.unwrap();
+    let scoped = store.scoped(IdentityKind::Aci);
+    let record = PreKeyStore::get_pre_key(&scoped, first_id).await.unwrap();
     assert!(!record.serialize().unwrap().is_empty());
 }
 
@@ -112,10 +112,10 @@ async fn generate_upload_persist_rolls_back_local_writes_on_upload_failure() {
     }
     // Local store must be empty post-rollback: no one-time prekey,
     // no signed prekey, no kyber prekey.
-    let s = store.clone();
     let first_id = PreKeyId::from(1u32);
+    let scoped = store.scoped(IdentityKind::Aci);
     assert!(
-        PreKeyStore::get_pre_key(&s, first_id).await.is_err(),
+        PreKeyStore::get_pre_key(&scoped, first_id).await.is_err(),
         "failed upload must not leave orphan one-time prekey"
     );
 }

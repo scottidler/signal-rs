@@ -61,6 +61,15 @@ impl IdentityKind {
             IdentityKind::Pni => "pni",
         }
     }
+
+    /// Value bound into the `identity_kind` column of the prekey
+    /// tables (see `migrations/0002_per_identity_prekeys.sql`).
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            IdentityKind::Aci => "aci",
+            IdentityKind::Pni => "pni",
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -169,32 +178,36 @@ pub async fn generate_batch<R: rand::Rng + rand::CryptoRng>(
 }
 
 /// Persist a generated batch to the local SQLite store via the
-/// pool-backed `SqliteStore`. Each save is its own atomic SQL op; the
-/// batch as a whole is not transactional. Prefer
+/// identity-scoped wrapper around `SqliteStore`. Each save is its own
+/// atomic SQL op; the batch as a whole is not transactional. Prefer
 /// [`persist_batch_in_tx`] for the upload-or-rollback path.
-pub async fn persist_batch(store: &SqliteStore, batch: &GeneratedBatch) -> Result<(), PrekeyError> {
+pub async fn persist_batch(
+    store: &SqliteStore,
+    batch: &GeneratedBatch,
+    identity_kind: IdentityKind,
+) -> Result<(), PrekeyError> {
     debug!(
-        "persist_batch: writing {} one-time + 1 signed + 1 kyber prekey to local store",
+        "persist_batch: identity={:?} writing {} one-time + 1 signed + 1 kyber prekey to local store",
+        identity_kind,
         batch.one_time_records.len()
     );
 
+    let mut scoped = store.scoped(identity_kind);
+
     for (idx, record) in batch.one_time_records.iter().enumerate() {
         let id = PreKeyId::from(batch.one_time_prekey_ids[idx]);
-        let mut store_mut = store.clone();
-        PreKeyStore::save_pre_key(&mut store_mut, id, record).await?;
+        PreKeyStore::save_pre_key(&mut scoped, id, record).await?;
     }
 
-    let mut store_mut = store.clone();
     SignedPreKeyStore::save_signed_pre_key(
-        &mut store_mut,
+        &mut scoped,
         SignedPreKeyId::from(batch.signed_prekey_id),
         &batch.signed_record,
     )
     .await?;
 
-    let mut store_mut = store.clone();
     libsignal_protocol::KyberPreKeyStore::save_kyber_pre_key(
-        &mut store_mut,
+        &mut scoped,
         libsignal_protocol::KyberPreKeyId::from(batch.kyber_prekey_id),
         &batch.kyber_record,
     )
@@ -204,22 +217,23 @@ pub async fn persist_batch(store: &SqliteStore, batch: &GeneratedBatch) -> Resul
 }
 
 /// Persist a generated batch inside the given [`TxStore`]'s in-flight
-/// transaction. Used by [`generate_upload_persist`] so that an upload
-/// failure or a commit failure rolls back the prekey writes
-/// atomically, preventing the "server has prekeys but local DB
-/// doesn't" failure mode the Architect flagged.
+/// transaction, scoped to one identity. Used by
+/// [`generate_upload_persist`] so that an upload failure or a commit
+/// failure rolls back the prekey writes atomically.
 async fn persist_batch_in_tx(
     tx_store: &crate::storage::tx::TxStore,
     batch: &GeneratedBatch,
+    identity_kind: IdentityKind,
 ) -> Result<(), PrekeyError> {
     debug!(
-        "persist_batch_in_tx: writing {} one-time + 1 signed + 1 kyber prekey inside transaction",
+        "persist_batch_in_tx: identity={:?} writing {} one-time + 1 signed + 1 kyber prekey inside transaction",
+        identity_kind,
         batch.one_time_records.len()
     );
 
-    let mut pre_key = tx_store.pre_key_store();
-    let mut signed = tx_store.signed_pre_key_store();
-    let mut kyber = tx_store.kyber_pre_key_store();
+    let mut pre_key = tx_store.pre_key_store(identity_kind);
+    let mut signed = tx_store.signed_pre_key_store(identity_kind);
+    let mut kyber = tx_store.kyber_pre_key_store(identity_kind);
 
     for (idx, record) in batch.one_time_records.iter().enumerate() {
         let id = PreKeyId::from(batch.one_time_prekey_ids[idx]);
@@ -313,7 +327,7 @@ pub async fn generate_upload_persist<R: rand::Rng + rand::CryptoRng>(
     let pool = store.pool().clone();
     let tx = pool.begin().await.map_err(crate::storage::StoreError::from)?;
     let tx_store = crate::storage::tx::TxStore::new(tx);
-    persist_batch_in_tx(&tx_store, &batch).await?;
+    persist_batch_in_tx(&tx_store, &batch, identity_kind).await?;
 
     // 4. Attempt the upload using the pre-fetched credentials. No
     //    store access here — safe even though the tx still holds a

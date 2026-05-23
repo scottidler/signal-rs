@@ -332,22 +332,24 @@ async fn finalize_after_persist(
                     "pni_identity_keypair (required by /v1/devices/link)",
                 ));
             }
-            // PNI registration id: signal-cli reuses the ACI registration
-            // id for both during the link PUT.  We mirror that.
-            let pni_registration_id = aci_registration_id;
-
             let mut rng = rand::rng();
-            // ACI and PNI prekey pools live in disjoint server-side
-            // identity scopes, but our local libsignal-protocol stores
-            // are keyed by prekey id alone (no identity discriminator
-            // on the trait). To prevent ACI/PNI overwriting each other
-            // locally, allocate from disjoint id ranges: ACI uses
-            // 1..(2^23-1), PNI uses 2^23.. (libsignal's MAX_KEY_ID is
-            // 2^24-1, leaving each pool 8M ids of room).
-            const PNI_ID_OFFSET: u32 = 1 << 23;
+            // PNI registration id: independent of the ACI one.
+            // signal-cli's SignalAccount.createLinkedAccount calls
+            // KeyHelper.generateRegistrationId(false) twice (once per
+            // identity); Signal-Server's DeviceAttributes.java treats
+            // `pniRegistrationId` as a distinct JSON field.
+            // KeyHelper's range is 1..=16380.
+            let pni_registration_id: u32 = {
+                use rand::Rng as _;
+                rng.random_range(1..=16380)
+            };
+            store.set_pni_registration_id(pni_registration_id).await?;
+
+            // Per-identity prekey storage: ACI and PNI rows live in
+            // disjoint `(identity_kind, id)` partitions in the local
+            // SQLite tables, so both batches start at id=1.
             let aci_batch = crate::crypto::prekeys::generate_batch(&mut rng, store, IdentityKind::Aci, 1).await?;
-            let pni_batch =
-                crate::crypto::prekeys::generate_batch(&mut rng, store, IdentityKind::Pni, PNI_ID_OFFSET + 1).await?;
+            let pni_batch = crate::crypto::prekeys::generate_batch(&mut rng, store, IdentityKind::Pni, 1).await?;
 
             let aci_prekeys = crate::api::LinkPreKeys {
                 signed_record: &aci_batch.signed_record,
@@ -381,8 +383,8 @@ async fn finalize_after_persist(
             // available for the followup /v2/keys upload and so that
             // libsignal-protocol's session machinery can resolve any
             // prekey id a peer references.
-            crate::crypto::prekeys::persist_batch(store, &aci_batch).await?;
-            crate::crypto::prekeys::persist_batch(store, &pni_batch).await?;
+            crate::crypto::prekeys::persist_batch(store, &aci_batch, IdentityKind::Aci).await?;
+            crate::crypto::prekeys::persist_batch(store, &pni_batch, IdentityKind::Pni).await?;
 
             assigned
         }

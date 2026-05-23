@@ -13,10 +13,12 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 use super::{Identity, LinkStatus, Store, StoreError};
+use crate::crypto::prekeys::IdentityKind;
 
 const IDENTITY_KEY_KEYPAIR: &str = "identity_keypair";
 const IDENTITY_KEY_PNI_KEYPAIR: &str = "pni_identity_keypair";
 const IDENTITY_KEY_REGISTRATION_ID: &str = "registration_id";
+const IDENTITY_KEY_PNI_REGISTRATION_ID: &str = "pni_registration_id";
 const IDENTITY_KEY_ACCOUNT_NUMBER: &str = "account_number";
 const IDENTITY_KEY_DEVICE_ID: &str = "device_id";
 const IDENTITY_KEY_LINK_STATUS: &str = "link_status";
@@ -25,6 +27,27 @@ const IDENTITY_KEY_PNI: &str = "pni";
 const IDENTITY_KEY_ACI: &str = "aci";
 const IDENTITY_KEY_PROFILE_KEY: &str = "profile_key";
 const IDENTITY_KEY_PROVISIONING_CODE: &str = "provisioning_code";
+
+// SQL strings hoisted to module-level constants so the pool-backed
+// `IdentityScopedStore` and the transaction-backed `Tx*Store` use
+// bit-identical queries and cannot drift apart over time. Phase 2
+// references the same constants from `src/storage/tx.rs`.
+pub(crate) const SELECT_PREKEY_BY_KIND_AND_ID: &str = "SELECT record FROM prekeys WHERE identity_kind = ? AND id = ?";
+pub(crate) const INSERT_PREKEY_BY_KIND: &str =
+    "INSERT OR REPLACE INTO prekeys (identity_kind, id, record) VALUES (?, ?, ?)";
+pub(crate) const DELETE_PREKEY_BY_KIND_AND_ID: &str = "DELETE FROM prekeys WHERE identity_kind = ? AND id = ?";
+
+pub(crate) const SELECT_SIGNED_PREKEY_BY_KIND_AND_ID: &str =
+    "SELECT record FROM signed_prekeys WHERE identity_kind = ? AND id = ?";
+pub(crate) const INSERT_SIGNED_PREKEY_BY_KIND: &str =
+    "INSERT OR REPLACE INTO signed_prekeys (identity_kind, id, record) VALUES (?, ?, ?)";
+
+pub(crate) const SELECT_KYBER_PREKEY_BY_KIND_AND_ID: &str =
+    "SELECT record FROM kyber_prekeys WHERE identity_kind = ? AND id = ?";
+pub(crate) const INSERT_KYBER_PREKEY_BY_KIND: &str =
+    "INSERT OR REPLACE INTO kyber_prekeys (identity_kind, id, record, used) VALUES (?, ?, ?, 0)";
+pub(crate) const DELETE_KYBER_PREKEY_BY_KIND_AND_ID: &str =
+    "DELETE FROM kyber_prekeys WHERE identity_kind = ? AND id = ?";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -207,6 +230,47 @@ impl SqliteStore {
         }
     }
 
+    /// Persist the PNI registration id. signal-cli generates two
+    /// independent registration ids at link time (one per identity),
+    /// and Signal-Server's `/v1/devices/link` accepts `pniRegistrationId`
+    /// as a distinct field. Stored as 4 big-endian bytes alongside the
+    /// existing `registration_id` row.
+    pub async fn set_pni_registration_id(&self, pni_registration_id: u32) -> Result<(), StoreError> {
+        debug!("set_pni_registration_id: pni_registration_id={}", pni_registration_id);
+        self.put_identity_value(IDENTITY_KEY_PNI_REGISTRATION_ID, &pni_registration_id.to_be_bytes())
+            .await
+    }
+
+    /// Load the PNI registration id, if persisted.
+    pub async fn get_pni_registration_id(&self) -> Result<Option<u32>, StoreError> {
+        debug!("get_pni_registration_id:");
+        match self.get_identity_value(IDENTITY_KEY_PNI_REGISTRATION_ID).await? {
+            Some(bytes) => {
+                let arr: [u8; 4] = bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Corrupt("pni_registration_id length".into()))?;
+                Ok(Some(u32::from_be_bytes(arr)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Mint an `IdentityScopedStore` bound to the given identity. The
+    /// scoped store implements `PreKeyStore`, `SignedPreKeyStore`,
+    /// `KyberPreKeyStore`, and `IdentityKeyStore`; every SQL query in
+    /// those impls filters by `identity_kind` so ACI and PNI prekey
+    /// pools cannot collide. Construction is infallible; if the
+    /// underlying row is missing (e.g. PNI keypair before
+    /// ProvisionMessage processing), the error surfaces lazily on the
+    /// first trait call that needs it.
+    pub fn scoped(&self, identity_kind: IdentityKind) -> IdentityScopedStore {
+        IdentityScopedStore {
+            pool: self.pool.clone(),
+            identity_kind,
+        }
+    }
+
     /// Clear the provisioning code after device-completion succeeds.
     /// Signal's server only accepts each provisioning code once; keeping
     /// it around invites a retry that the server would 409.
@@ -344,6 +408,16 @@ impl Store for SqliteStore {
 
 // libsignal-protocol storage traits below. All error returns are
 // `SignalProtocolError` per the trait's `Result<T>` alias.
+//
+// `SessionStore` lives on `SqliteStore` directly: sessions are keyed
+// by `ProtocolAddress` (service id + device id), which already encodes
+// the identity at the row level.
+//
+// `PreKeyStore`, `SignedPreKeyStore`, `KyberPreKeyStore`, and
+// `IdentityKeyStore` live on `IdentityScopedStore` further down. The
+// scoped wrapper is constructed via `SqliteStore::scoped(kind)` and
+// every SQL query in those impls filters by `identity_kind` so ACI
+// and PNI pools cannot collide.
 
 fn map_err(e: StoreError) -> SignalProtocolError {
     SignalProtocolError::InvalidArgument(format!("storage: {e}"))
@@ -351,97 +425,6 @@ fn map_err(e: StoreError) -> SignalProtocolError {
 
 fn map_sqlx(e: sqlx::Error) -> SignalProtocolError {
     map_err(StoreError::Sqlx(e))
-}
-
-#[async_trait(?Send)]
-impl IdentityKeyStore for SqliteStore {
-    async fn get_identity_key_pair(&self) -> Result<IdentityKeyPair, SignalProtocolError> {
-        trace!("get_identity_key_pair:");
-        let bytes = self
-            .get_identity_value(IDENTITY_KEY_KEYPAIR)
-            .await
-            .map_err(map_err)?
-            .ok_or_else(|| SignalProtocolError::InvalidArgument("identity_keypair not persisted".into()))?;
-        IdentityKeyPair::try_from(&bytes[..])
-    }
-
-    async fn get_local_registration_id(&self) -> Result<u32, SignalProtocolError> {
-        trace!("get_local_registration_id:");
-        let bytes = self
-            .get_identity_value(IDENTITY_KEY_REGISTRATION_ID)
-            .await
-            .map_err(map_err)?
-            .ok_or_else(|| SignalProtocolError::InvalidArgument("registration_id not persisted".into()))?;
-        let arr: [u8; 4] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| SignalProtocolError::InvalidArgument("registration_id length".into()))?;
-        Ok(u32::from_be_bytes(arr))
-    }
-
-    async fn save_identity(
-        &mut self,
-        address: &ProtocolAddress,
-        identity: &IdentityKey,
-    ) -> Result<IdentityChange, SignalProtocolError> {
-        debug!("save_identity: address={}", address);
-        let key = address.to_string();
-        let new_key_bytes = identity.serialize();
-        let existing = sqlx::query("SELECT key FROM identities WHERE address = ?")
-            .bind(&key)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_sqlx)?
-            .map(|r| r.get::<Vec<u8>, _>("key"));
-        sqlx::query("INSERT OR REPLACE INTO identities (address, key) VALUES (?, ?)")
-            .bind(&key)
-            .bind(new_key_bytes.as_ref())
-            .execute(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
-        Ok(match existing {
-            Some(prev) if prev.as_slice() == new_key_bytes.as_ref() => IdentityChange::NewOrUnchanged,
-            Some(_) => IdentityChange::ReplacedExisting,
-            None => IdentityChange::NewOrUnchanged,
-        })
-    }
-
-    async fn is_trusted_identity(
-        &self,
-        address: &ProtocolAddress,
-        identity: &IdentityKey,
-        _direction: Direction,
-    ) -> Result<bool, SignalProtocolError> {
-        trace!("is_trusted_identity: address={}", address);
-        let row = sqlx::query("SELECT key FROM identities WHERE address = ?")
-            .bind(address.to_string())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
-        match row {
-            None => Ok(true),
-            Some(r) => {
-                let stored = r.get::<Vec<u8>, _>("key");
-                Ok(stored.as_slice() == identity.serialize().as_ref())
-            }
-        }
-    }
-
-    async fn get_identity(&self, address: &ProtocolAddress) -> Result<Option<IdentityKey>, SignalProtocolError> {
-        trace!("get_identity: address={}", address);
-        let row = sqlx::query("SELECT key FROM identities WHERE address = ?")
-            .bind(address.to_string())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
-        match row {
-            None => Ok(None),
-            Some(r) => {
-                let bytes = r.get::<Vec<u8>, _>("key");
-                IdentityKey::decode(&bytes).map(Some)
-            }
-        }
-    }
 }
 
 #[async_trait(?Send)]
@@ -479,12 +462,156 @@ impl SessionStore for SqliteStore {
     }
 }
 
+/// Pool-backed libsignal-protocol storage scoped to one identity (ACI
+/// or PNI). All four trait impls (`PreKeyStore`, `SignedPreKeyStore`,
+/// `KyberPreKeyStore`, `IdentityKeyStore`) filter on `identity_kind`,
+/// so the same `SqlitePool` backs both ACI and PNI without row
+/// collisions.
+///
+/// Construction is infallible (see `SqliteStore::scoped`). Errors for
+/// missing identity rows surface lazily on the first trait call that
+/// reads them.
+#[derive(Debug, Clone)]
+pub struct IdentityScopedStore {
+    pool: SqlitePool,
+    identity_kind: IdentityKind,
+}
+
+impl IdentityScopedStore {
+    pub fn identity_kind(&self) -> IdentityKind {
+        self.identity_kind
+    }
+
+    fn keypair_row_name(&self) -> &'static str {
+        match self.identity_kind {
+            IdentityKind::Aci => IDENTITY_KEY_KEYPAIR,
+            IdentityKind::Pni => IDENTITY_KEY_PNI_KEYPAIR,
+        }
+    }
+
+    fn registration_id_row_name(&self) -> &'static str {
+        match self.identity_kind {
+            IdentityKind::Aci => IDENTITY_KEY_REGISTRATION_ID,
+            IdentityKind::Pni => IDENTITY_KEY_PNI_REGISTRATION_ID,
+        }
+    }
+}
+
 #[async_trait(?Send)]
-impl PreKeyStore for SqliteStore {
+impl IdentityKeyStore for IdentityScopedStore {
+    async fn get_identity_key_pair(&self) -> Result<IdentityKeyPair, SignalProtocolError> {
+        let row_name = self.keypair_row_name();
+        trace!(
+            "scoped[{:?}]::get_identity_key_pair: row={}",
+            self.identity_kind, row_name
+        );
+        let row = sqlx::query("SELECT value FROM identity WHERE key = ?")
+            .bind(row_name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or_else(|| {
+                SignalProtocolError::InvalidArgument(format!("{row_name} not persisted (identity_kind missing)"))
+            })?;
+        let bytes = row.get::<Vec<u8>, _>("value");
+        IdentityKeyPair::try_from(&bytes[..])
+    }
+
+    async fn get_local_registration_id(&self) -> Result<u32, SignalProtocolError> {
+        let row_name = self.registration_id_row_name();
+        trace!(
+            "scoped[{:?}]::get_local_registration_id: row={}",
+            self.identity_kind, row_name
+        );
+        let row = sqlx::query("SELECT value FROM identity WHERE key = ?")
+            .bind(row_name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or_else(|| SignalProtocolError::InvalidArgument(format!("{row_name} not persisted")))?;
+        let bytes = row.get::<Vec<u8>, _>("value");
+        let arr: [u8; 4] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| SignalProtocolError::InvalidArgument(format!("{row_name} length")))?;
+        Ok(u32::from_be_bytes(arr))
+    }
+
+    async fn save_identity(
+        &mut self,
+        address: &ProtocolAddress,
+        identity: &IdentityKey,
+    ) -> Result<IdentityChange, SignalProtocolError> {
+        debug!("scoped[{:?}]::save_identity: address={}", self.identity_kind, address);
+        let key = address.to_string();
+        let new_key_bytes = identity.serialize();
+        let existing = sqlx::query("SELECT key FROM identities WHERE address = ?")
+            .bind(&key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .map(|r| r.get::<Vec<u8>, _>("key"));
+        sqlx::query("INSERT OR REPLACE INTO identities (address, key) VALUES (?, ?)")
+            .bind(&key)
+            .bind(new_key_bytes.as_ref())
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(match existing {
+            Some(prev) if prev.as_slice() == new_key_bytes.as_ref() => IdentityChange::NewOrUnchanged,
+            Some(_) => IdentityChange::ReplacedExisting,
+            None => IdentityChange::NewOrUnchanged,
+        })
+    }
+
+    async fn is_trusted_identity(
+        &self,
+        address: &ProtocolAddress,
+        identity: &IdentityKey,
+        _direction: Direction,
+    ) -> Result<bool, SignalProtocolError> {
+        trace!(
+            "scoped[{:?}]::is_trusted_identity: address={}",
+            self.identity_kind, address
+        );
+        let row = sqlx::query("SELECT key FROM identities WHERE address = ?")
+            .bind(address.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        match row {
+            None => Ok(true),
+            Some(r) => {
+                let stored = r.get::<Vec<u8>, _>("key");
+                Ok(stored.as_slice() == identity.serialize().as_ref())
+            }
+        }
+    }
+
+    async fn get_identity(&self, address: &ProtocolAddress) -> Result<Option<IdentityKey>, SignalProtocolError> {
+        trace!("scoped[{:?}]::get_identity: address={}", self.identity_kind, address);
+        let row = sqlx::query("SELECT key FROM identities WHERE address = ?")
+            .bind(address.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        match row {
+            None => Ok(None),
+            Some(r) => {
+                let bytes = r.get::<Vec<u8>, _>("key");
+                IdentityKey::decode(&bytes).map(Some)
+            }
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl PreKeyStore for IdentityScopedStore {
     async fn get_pre_key(&self, prekey_id: PreKeyId) -> Result<PreKeyRecord, SignalProtocolError> {
         let id: u32 = prekey_id.into();
-        trace!("get_pre_key: id={}", id);
-        let row = sqlx::query("SELECT record FROM prekeys WHERE id = ?")
+        trace!("scoped[{:?}]::get_pre_key: id={}", self.identity_kind, id);
+        let row = sqlx::query(SELECT_PREKEY_BY_KIND_AND_ID)
+            .bind(self.identity_kind.as_db_str())
             .bind(id as i64)
             .fetch_optional(&self.pool)
             .await
@@ -496,9 +623,10 @@ impl PreKeyStore for SqliteStore {
 
     async fn save_pre_key(&mut self, prekey_id: PreKeyId, record: &PreKeyRecord) -> Result<(), SignalProtocolError> {
         let id: u32 = prekey_id.into();
-        debug!("save_pre_key: id={}", id);
+        debug!("scoped[{:?}]::save_pre_key: id={}", self.identity_kind, id);
         let bytes = record.serialize()?;
-        sqlx::query("INSERT OR REPLACE INTO prekeys (id, record) VALUES (?, ?)")
+        sqlx::query(INSERT_PREKEY_BY_KIND)
+            .bind(self.identity_kind.as_db_str())
             .bind(id as i64)
             .bind(bytes)
             .execute(&self.pool)
@@ -509,8 +637,9 @@ impl PreKeyStore for SqliteStore {
 
     async fn remove_pre_key(&mut self, prekey_id: PreKeyId) -> Result<(), SignalProtocolError> {
         let id: u32 = prekey_id.into();
-        debug!("remove_pre_key: id={}", id);
-        sqlx::query("DELETE FROM prekeys WHERE id = ?")
+        debug!("scoped[{:?}]::remove_pre_key: id={}", self.identity_kind, id);
+        sqlx::query(DELETE_PREKEY_BY_KIND_AND_ID)
+            .bind(self.identity_kind.as_db_str())
             .bind(id as i64)
             .execute(&self.pool)
             .await
@@ -520,14 +649,15 @@ impl PreKeyStore for SqliteStore {
 }
 
 #[async_trait(?Send)]
-impl SignedPreKeyStore for SqliteStore {
+impl SignedPreKeyStore for IdentityScopedStore {
     async fn get_signed_pre_key(
         &self,
         signed_prekey_id: SignedPreKeyId,
     ) -> Result<SignedPreKeyRecord, SignalProtocolError> {
         let id: u32 = signed_prekey_id.into();
-        trace!("get_signed_pre_key: id={}", id);
-        let row = sqlx::query("SELECT record FROM signed_prekeys WHERE id = ?")
+        trace!("scoped[{:?}]::get_signed_pre_key: id={}", self.identity_kind, id);
+        let row = sqlx::query(SELECT_SIGNED_PREKEY_BY_KIND_AND_ID)
+            .bind(self.identity_kind.as_db_str())
             .bind(id as i64)
             .fetch_optional(&self.pool)
             .await
@@ -543,9 +673,10 @@ impl SignedPreKeyStore for SqliteStore {
         record: &SignedPreKeyRecord,
     ) -> Result<(), SignalProtocolError> {
         let id: u32 = signed_prekey_id.into();
-        debug!("save_signed_pre_key: id={}", id);
+        debug!("scoped[{:?}]::save_signed_pre_key: id={}", self.identity_kind, id);
         let bytes = record.serialize()?;
-        sqlx::query("INSERT OR REPLACE INTO signed_prekeys (id, record) VALUES (?, ?)")
+        sqlx::query(INSERT_SIGNED_PREKEY_BY_KIND)
+            .bind(self.identity_kind.as_db_str())
             .bind(id as i64)
             .bind(bytes)
             .execute(&self.pool)
@@ -556,14 +687,15 @@ impl SignedPreKeyStore for SqliteStore {
 }
 
 #[async_trait(?Send)]
-impl KyberPreKeyStore for SqliteStore {
+impl KyberPreKeyStore for IdentityScopedStore {
     async fn get_kyber_pre_key(
         &self,
         kyber_prekey_id: KyberPreKeyId,
     ) -> Result<KyberPreKeyRecord, SignalProtocolError> {
         let id: u32 = kyber_prekey_id.into();
-        trace!("get_kyber_pre_key: id={}", id);
-        let row = sqlx::query("SELECT record FROM kyber_prekeys WHERE id = ?")
+        trace!("scoped[{:?}]::get_kyber_pre_key: id={}", self.identity_kind, id);
+        let row = sqlx::query(SELECT_KYBER_PREKEY_BY_KIND_AND_ID)
+            .bind(self.identity_kind.as_db_str())
             .bind(id as i64)
             .fetch_optional(&self.pool)
             .await
@@ -579,9 +711,10 @@ impl KyberPreKeyStore for SqliteStore {
         record: &KyberPreKeyRecord,
     ) -> Result<(), SignalProtocolError> {
         let id: u32 = kyber_prekey_id.into();
-        debug!("save_kyber_pre_key: id={}", id);
+        debug!("scoped[{:?}]::save_kyber_pre_key: id={}", self.identity_kind, id);
         let bytes = record.serialize()?;
-        sqlx::query("INSERT OR REPLACE INTO kyber_prekeys (id, record, used) VALUES (?, ?, 0)")
+        sqlx::query(INSERT_KYBER_PREKEY_BY_KIND)
+            .bind(self.identity_kind.as_db_str())
             .bind(id as i64)
             .bind(bytes)
             .execute(&self.pool)
@@ -597,10 +730,11 @@ impl KyberPreKeyStore for SqliteStore {
         _base_key: &PublicKey,
     ) -> Result<(), SignalProtocolError> {
         let id: u32 = kyber_prekey_id.into();
-        debug!("mark_kyber_pre_key_used: id={}", id);
-        // v0.1 treats all kyber prekeys as one-time (no last-resort distinction).
-        // Mark used and delete; Phase 7+ can revisit if last-resort handling lands.
-        sqlx::query("DELETE FROM kyber_prekeys WHERE id = ?")
+        debug!("scoped[{:?}]::mark_kyber_pre_key_used: id={}", self.identity_kind, id);
+        // v0.1 treats all kyber prekeys as one-time (no last-resort
+        // distinction). Mark used by deletion.
+        sqlx::query(DELETE_KYBER_PREKEY_BY_KIND_AND_ID)
+            .bind(self.identity_kind.as_db_str())
             .bind(id as i64)
             .execute(&self.pool)
             .await
