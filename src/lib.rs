@@ -17,11 +17,13 @@
 //!   `libsignal-net`'s `ProvisioningConnection` themselves.
 //! - [`crypto`] - the ProvisioningCipher port + prekey helpers.
 
+pub mod api;
 pub mod client;
 pub mod config;
 pub mod crypto;
 pub mod envelope;
 pub mod link;
+pub mod net;
 pub mod storage;
 
 pub use client::{Client, OpenError, ReceiveError, SendError};

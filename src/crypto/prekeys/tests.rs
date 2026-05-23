@@ -66,12 +66,18 @@ async fn second_batch_uses_disjoint_ids() {
 }
 
 #[tokio::test]
-async fn upload_batch_returns_not_implemented_until_phase_10() {
+async fn upload_batch_against_missing_credentials_errors_cleanly() {
+    // A bare in-memory store has no password/aci persisted; upload_batch
+    // must surface a clean MissingCredential-style error rather than panic
+    // or attempt the live request.
     let store = linked_store().await;
     let mut rng = ChaCha20Rng::seed_from_u64(9);
     let batch = generate_and_persist_batch(&mut rng, &store, 1).await.unwrap();
     match upload_batch(&store, &batch).await {
-        Err(PrekeyError::UploadNotImplemented) => {}
-        other => panic!("expected UploadNotImplemented, got {:?}", other),
+        Err(PrekeyError::Upload(msg)) => assert!(
+            msg.contains("aci") || msg.contains("password") || msg.contains("missing"),
+            "expected credential message, got {msg}"
+        ),
+        other => panic!("expected Upload(missing-credential) error, got {:?}", other),
     }
 }

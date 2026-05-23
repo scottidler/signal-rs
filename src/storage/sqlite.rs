@@ -19,6 +19,11 @@ const IDENTITY_KEY_REGISTRATION_ID: &str = "registration_id";
 const IDENTITY_KEY_ACCOUNT_NUMBER: &str = "account_number";
 const IDENTITY_KEY_DEVICE_ID: &str = "device_id";
 const IDENTITY_KEY_LINK_STATUS: &str = "link_status";
+const IDENTITY_KEY_PASSWORD: &str = "password";
+const IDENTITY_KEY_PNI: &str = "pni";
+const IDENTITY_KEY_ACI: &str = "aci";
+const IDENTITY_KEY_PROFILE_KEY: &str = "profile_key";
+const IDENTITY_KEY_PROVISIONING_CODE: &str = "provisioning_code";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -73,6 +78,108 @@ impl SqliteStore {
         sqlx::query("INSERT OR REPLACE INTO identity (key, value) VALUES (?, ?)")
             .bind(key)
             .bind(value)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Store the device password minted at link time. Used as the
+    /// `password` half of HTTP Basic auth on every authenticated call to
+    /// `chat.signal.org`.
+    pub async fn set_password(&self, password: &str) -> Result<(), StoreError> {
+        self.put_identity_value(IDENTITY_KEY_PASSWORD, password.as_bytes())
+            .await
+    }
+
+    /// Load the device password. `None` if linking has not reached the
+    /// device-completion step.
+    pub async fn get_password(&self) -> Result<Option<String>, StoreError> {
+        match self.get_identity_value(IDENTITY_KEY_PASSWORD).await? {
+            Some(bytes) => Ok(Some(
+                String::from_utf8(bytes).map_err(|e| StoreError::Corrupt(format!("password utf8: {e}")))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Overwrite device_id - used by the device-completion step in `link()`
+    /// once Signal's server has assigned us a real device id.
+    pub async fn set_device_id(&self, device_id: u32) -> Result<(), StoreError> {
+        self.put_identity_value(IDENTITY_KEY_DEVICE_ID, &device_id.to_be_bytes())
+            .await
+    }
+
+    /// Persist the ACI (account identifier UUID string). Stored as a sibling
+    /// of `account_number` (E.164); the Signal protocol uses ACI for routing.
+    pub async fn set_aci(&self, aci: &str) -> Result<(), StoreError> {
+        self.put_identity_value(IDENTITY_KEY_ACI, aci.as_bytes()).await
+    }
+
+    /// Load the persisted ACI string, if any.
+    pub async fn get_aci(&self) -> Result<Option<String>, StoreError> {
+        match self.get_identity_value(IDENTITY_KEY_ACI).await? {
+            Some(bytes) => Ok(Some(
+                String::from_utf8(bytes).map_err(|e| StoreError::Corrupt(format!("aci utf8: {e}")))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the PNI (phone-number identifier UUID string), if the
+    /// ProvisionMessage carried one.
+    pub async fn set_pni(&self, pni: &str) -> Result<(), StoreError> {
+        self.put_identity_value(IDENTITY_KEY_PNI, pni.as_bytes()).await
+    }
+
+    /// Load the persisted PNI string, if any.
+    pub async fn get_pni(&self) -> Result<Option<String>, StoreError> {
+        match self.get_identity_value(IDENTITY_KEY_PNI).await? {
+            Some(bytes) => Ok(Some(
+                String::from_utf8(bytes).map_err(|e| StoreError::Corrupt(format!("pni utf8: {e}")))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the profile key from the ProvisionMessage. Required for
+    /// upload-the-profile-name and Note-to-Self decoding paths.
+    pub async fn set_profile_key(&self, profile_key: &[u8]) -> Result<(), StoreError> {
+        self.put_identity_value(IDENTITY_KEY_PROFILE_KEY, profile_key).await
+    }
+
+    /// Load the persisted profile key.
+    pub async fn get_profile_key(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        self.get_identity_value(IDENTITY_KEY_PROFILE_KEY).await
+    }
+
+    /// Persist the one-shot provisioning code from the ProvisionMessage.
+    /// Needed by the device-completion HTTP call; persisting it lets
+    /// `link()` resume after a crash between identity persistence and
+    /// device registration. Cleared after a successful PUT to
+    /// `/v1/devices/{code}`.
+    pub async fn set_provisioning_code(&self, code: &str) -> Result<(), StoreError> {
+        self.put_identity_value(IDENTITY_KEY_PROVISIONING_CODE, code.as_bytes())
+            .await
+    }
+
+    /// Load the persisted provisioning code, if any.
+    pub async fn get_provisioning_code(&self) -> Result<Option<String>, StoreError> {
+        match self.get_identity_value(IDENTITY_KEY_PROVISIONING_CODE).await? {
+            Some(bytes) => {
+                Ok(Some(String::from_utf8(bytes).map_err(|e| {
+                    StoreError::Corrupt(format!("provisioning_code utf8: {e}"))
+                })?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Clear the provisioning code after device-completion succeeds.
+    /// Signal's server only accepts each provisioning code once; keeping
+    /// it around invites a retry that the server would 409.
+    pub async fn clear_provisioning_code(&self) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM identity WHERE key = ?")
+            .bind(IDENTITY_KEY_PROVISIONING_CODE)
             .execute(&self.pool)
             .await?;
         Ok(())

@@ -208,11 +208,7 @@ async fn finalize_link_with_tampered_envelope_fails_at_mac_and_does_not_persist(
     }
 }
 
-#[tokio::test]
-async fn live_server_link_returns_not_implemented_error() {
-    let tmp = tempfile::tempdir().unwrap();
-    match link(tmp.path(), "test-device", |_| {}).await {
-        Err(LinkError::LiveServerNotImplemented) => {}
-        other => panic!("expected LiveServerNotImplemented, got {:?}", other),
-    }
-}
+// link() against live Signal servers cannot be unit-tested without a
+// phone scan; Phase 10's manual smoke test covers it. The
+// `persist_provision_message` / `finalize_link` integration tests above
+// exercise the post-decrypt path with synthesized envelopes.

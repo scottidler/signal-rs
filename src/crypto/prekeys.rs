@@ -31,11 +31,11 @@ pub enum PrekeyError {
     #[error("libsignal-protocol error: {0}")]
     Signal(#[from] SignalProtocolError),
 
-    #[error(
-        "prekey upload to Signal's keyserver is not yet wired; \
-         Phase 10 wires libsignal-net-chat's keys endpoint"
-    )]
-    UploadNotImplemented,
+    #[error("storage error during upload: {0}")]
+    Store(crate::storage::StoreError),
+
+    #[error("prekey upload failed: {0}")]
+    Upload(String),
 }
 
 /// Output of a single prekey-generation pass: the IDs assigned to each
@@ -120,12 +120,16 @@ pub async fn generate_and_persist_batch<R: rand::Rng + rand::CryptoRng>(
     })
 }
 
-/// Upload a generated batch to Signal's keyserver. Currently returns
-/// `PrekeyError::UploadNotImplemented`; Phase 10 wires this to
-/// `libsignal-net-chat`'s `set_pre_keys` (or equivalent) endpoint.
-pub async fn upload_batch(_: &SqliteStore, _: &GeneratedBatch) -> Result<(), PrekeyError> {
-    log::warn!("upload_batch: live upload is Phase 10");
-    Err(PrekeyError::UploadNotImplemented)
+/// Upload a generated batch to Signal's keyserver. Dispatches to the
+/// raw-HTTPS keys-endpoint helper in [`crate::api`].
+pub async fn upload_batch(store: &SqliteStore, batch: &GeneratedBatch) -> Result<(), PrekeyError> {
+    log::debug!("upload_batch: dispatching to api::upload_keys_for_aci");
+    crate::api::upload_keys_for_aci(store, batch)
+        .await
+        .map_err(|e| match e {
+            crate::api::ApiError::Storage(s) => PrekeyError::Store(s),
+            other => PrekeyError::Upload(other.to_string()),
+        })
 }
 
 #[cfg(test)]
