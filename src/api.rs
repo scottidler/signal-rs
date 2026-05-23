@@ -353,6 +353,79 @@ mod tests {
         assert_eq!(decoded, raw);
     }
 
+    #[tokio::test]
+    async fn prekey_upload_body_from_real_records_serializes_correctly() {
+        // Architect (c): build a PreKeyUploadBody from real
+        // PreKeyRecord / SignedPreKeyRecord / KyberPreKeyRecord bytes
+        // (not synthetic "AAEC" strings) and snapshot the field
+        // structure of the resulting JSON. Catches encoding-layer bugs
+        // (b64 padding, libsignal serialize() format changes) that the
+        // synthetic test below cannot see.
+        use crate::SqliteStore;
+        use crate::crypto::prekeys::generate_and_persist_batch;
+        use libsignal_protocol::IdentityKeyPair;
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha20Rng;
+
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let mut rng = ChaCha20Rng::seed_from_u64(0xC0DE);
+        let identity = IdentityKeyPair::generate(&mut rng);
+        store
+            .save_identity_bundle(&identity, 12345, "+15555550100", 1, crate::storage::LinkStatus::Linked)
+            .await
+            .unwrap();
+        let batch = generate_and_persist_batch(&mut rng, &store, 1).await.unwrap();
+        let body = build_prekey_upload_body(&store, &identity, &batch).await.unwrap();
+
+        let json: serde_json::Value = serde_json::to_value(&body).unwrap();
+        let obj = json.as_object().expect("body is a JSON object");
+
+        // Required fields - presence + camelCase casing
+        assert!(obj.contains_key("identityKey"), "identityKey present");
+        assert!(obj.contains_key("preKeys"), "preKeys present");
+        assert!(obj.contains_key("signedPreKey"), "signedPreKey present");
+        assert!(obj.contains_key("pqLastResortPreKey"), "pqLastResortPreKey present");
+
+        // pqPreKeys MUST be omitted when empty (Signal server rejects [])
+        assert!(!obj.contains_key("pqPreKeys"), "empty pqPreKeys must be omitted");
+
+        // Snake-case escapes that would indicate a serde rename mistake
+        for snake in ["identity_key", "pre_keys", "signed_pre_key", "pq_last_resort_pre_key"] {
+            assert!(!obj.contains_key(snake), "snake_case leak: {snake}");
+        }
+
+        // preKeys is the right length (PREKEY_BATCH_SIZE = 100)
+        let pre_keys = obj["preKeys"].as_array().unwrap();
+        assert_eq!(pre_keys.len(), crate::crypto::prekeys::PREKEY_BATCH_SIZE as usize);
+        for pk in pre_keys {
+            assert!(pk["keyId"].is_u64(), "preKey.keyId is uint");
+            let pubkey = pk["publicKey"].as_str().unwrap();
+            // libsignal-protocol's PublicKey::serialize() returns 33
+            // bytes (1-byte type tag + 32-byte curve point). After
+            // standard base64 with padding that's 44 chars.
+            assert_eq!(pubkey.len(), 44, "preKey.publicKey b64 length");
+        }
+
+        // signedPreKey shape - keyId/publicKey/signature
+        let spk = obj["signedPreKey"].as_object().unwrap();
+        assert!(spk.contains_key("keyId"));
+        assert!(spk.contains_key("publicKey"));
+        assert!(spk.contains_key("signature"));
+
+        // pqLastResortPreKey shape - same structure as signedPreKey but
+        // a Kyber public key (much larger). Just check the fields are
+        // present + signature non-empty.
+        let pq = obj["pqLastResortPreKey"].as_object().unwrap();
+        assert!(pq.contains_key("keyId"));
+        assert!(pq.contains_key("publicKey"));
+        assert!(pq.contains_key("signature"));
+        assert!(!pq["signature"].as_str().unwrap().is_empty());
+
+        // identityKey is base64(33-byte serialized public key)
+        let id_key = obj["identityKey"].as_str().unwrap();
+        assert_eq!(id_key.len(), 44, "identityKey b64 length");
+    }
+
     #[test]
     fn prekey_upload_body_serializes_to_expected_camel_case_shape() {
         // Snapshot test: pin the wire shape so any future field rename
