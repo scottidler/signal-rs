@@ -724,7 +724,6 @@ impl Client {
     ///   return Err here and the receive loop logs WARN and drops the
     ///   envelope without disconnecting.
     async fn process_envelope(&self, envelope_bytes: &[u8]) -> Result<Option<Envelope>, ReceiveError> {
-        use crate::crypto::prekeys::IdentityKind;
         debug!("process_envelope: envelope_len={}", envelope_bytes.len());
         let wire = proto::Envelope::decode(envelope_bytes).map_err(|e| {
             ReceiveError::Signal(libsignal_protocol::SignalProtocolError::InvalidArgument(format!(
@@ -771,22 +770,8 @@ impl Client {
             .await?
             .ok_or(ReceiveError::MissingCredential("aci"))?;
         let local_pni = self.inner.store.get_pni().await?;
-        let dest = wire.destination_service_id.as_deref();
-        let (identity_kind, local_service_id) = match (dest, local_pni.as_deref()) {
-            (Some(d), Some(pni)) if d == pni => (IdentityKind::Pni, d.to_string()),
-            (Some(d), _) if d == local_aci => (IdentityKind::Aci, local_aci.clone()),
-            (Some(d), _) => {
-                warn!(
-                    "process_envelope: destination_service_id={} matches neither local ACI ({}) nor PNI ({:?}); routing to ACI",
-                    d, local_aci, local_pni
-                );
-                (IdentityKind::Aci, local_aci.clone())
-            }
-            (None, _) => {
-                debug!("process_envelope: destination_service_id absent; routing to ACI");
-                (IdentityKind::Aci, local_aci.clone())
-            }
-        };
+        let (identity_kind, local_service_id) =
+            route_envelope_to_identity(wire.destination_service_id.as_deref(), &local_aci, local_pni.as_deref());
         let local_address = ProtocolAddress::new(local_service_id, device_id_from_u32(self.inner.identity.device_id)?);
         debug!(
             "process_envelope: routed identity_kind={:?} local_address={}",
@@ -824,6 +809,52 @@ impl Client {
 
         let decoded = decode_content(&plaintext, &wire);
         Ok(decoded)
+    }
+}
+
+/// Decide which local identity an inbound envelope is addressed to,
+/// and what `local_service_id` to construct the libsignal-protocol
+/// `local_address` from.
+///
+/// The wire envelope's `destination_service_id` (proto tag 13) is set
+/// by Signal-Server on every delivery; this routes by string-comparing
+/// it against the persisted ACI / PNI strings. Forward-compatible to
+/// sealed sender (the same field is present on UNIDENTIFIED_SENDER
+/// envelopes once we add handling for that type).
+///
+/// Behaviour:
+/// - destination matches local PNI -> route to PNI scope; local
+///   service id is the PNI string.
+/// - destination matches local ACI -> route to ACI scope; local
+///   service id is the ACI string.
+/// - destination is absent -> route to ACI; quiet debug log (legacy
+///   compatibility).
+/// - destination is present but matches neither -> route to ACI with
+///   a WARN. Should not happen in practice; the warn surfaces it.
+pub(crate) fn route_envelope_to_identity(
+    destination_service_id: Option<&str>,
+    local_aci: &str,
+    local_pni: Option<&str>,
+) -> (crate::crypto::prekeys::IdentityKind, String) {
+    use crate::crypto::prekeys::IdentityKind;
+    debug!(
+        "route_envelope_to_identity: dest={:?} local_aci={} local_pni={:?}",
+        destination_service_id, local_aci, local_pni
+    );
+    match (destination_service_id, local_pni) {
+        (Some(d), Some(pni)) if d == pni => (IdentityKind::Pni, d.to_string()),
+        (Some(d), _) if d == local_aci => (IdentityKind::Aci, local_aci.to_string()),
+        (Some(d), _) => {
+            warn!(
+                "route_envelope_to_identity: destination_service_id={} matches neither local ACI ({}) nor PNI ({:?}); routing to ACI",
+                d, local_aci, local_pni
+            );
+            (IdentityKind::Aci, local_aci.to_string())
+        }
+        (None, _) => {
+            debug!("route_envelope_to_identity: destination_service_id absent; routing to ACI");
+            (IdentityKind::Aci, local_aci.to_string())
+        }
     }
 }
 

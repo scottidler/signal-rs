@@ -118,3 +118,66 @@ async fn receive_returns_a_subscriber_even_before_loop_is_running() {
     // No producer yet, so the channel is empty - try_recv must say so.
     assert!(rx.try_recv().is_err(), "no envelopes yet");
 }
+
+// =============================================================================
+// route_envelope_to_identity: PNI vs ACI routing on inbound envelopes
+// =============================================================================
+//
+// process_envelope's full path requires a synthesized encrypted envelope,
+// which in turn requires pre-established sessions for ACI and PNI. The
+// routing decision itself was extracted to a pure free function so it
+// can be tested directly. The Phase 5 smoke is necessary but not
+// sufficient (primary-to-linked sync traffic is ACI-addressed); these
+// tests are the unit-level proxy for the PNI receive path.
+
+use crate::client::route_envelope_to_identity;
+use crate::crypto::prekeys::IdentityKind;
+
+const ACI: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+const PNI: &str = "pppppppp-pppp-pppp-pppp-pppppppppppp";
+
+#[test]
+fn route_pni_destination_routes_to_pni_scope() {
+    let (kind, local_service_id) = route_envelope_to_identity(Some(PNI), ACI, Some(PNI));
+    assert_eq!(kind, IdentityKind::Pni);
+    assert_eq!(local_service_id, PNI);
+}
+
+#[test]
+fn route_aci_destination_routes_to_aci_scope() {
+    let (kind, local_service_id) = route_envelope_to_identity(Some(ACI), ACI, Some(PNI));
+    assert_eq!(kind, IdentityKind::Aci);
+    assert_eq!(local_service_id, ACI);
+}
+
+#[test]
+fn route_missing_destination_defaults_to_aci() {
+    let (kind, local_service_id) = route_envelope_to_identity(None, ACI, Some(PNI));
+    assert_eq!(kind, IdentityKind::Aci);
+    assert_eq!(local_service_id, ACI);
+}
+
+#[test]
+fn route_unknown_destination_defaults_to_aci() {
+    let unknown = "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz";
+    let (kind, local_service_id) = route_envelope_to_identity(Some(unknown), ACI, Some(PNI));
+    assert_eq!(kind, IdentityKind::Aci);
+    assert_eq!(local_service_id, ACI);
+}
+
+#[test]
+fn route_pni_destination_without_local_pni_falls_through_to_aci() {
+    // No PNI persisted yet (early-link bootstrap or single-identity
+    // account). A destination that doesn't match ACI should route to
+    // ACI with a warn rather than mis-route to PNI scope.
+    let (kind, local_service_id) = route_envelope_to_identity(Some(PNI), ACI, None);
+    assert_eq!(kind, IdentityKind::Aci);
+    assert_eq!(local_service_id, ACI);
+}
+
+#[test]
+fn route_aci_destination_works_without_local_pni() {
+    let (kind, local_service_id) = route_envelope_to_identity(Some(ACI), ACI, None);
+    assert_eq!(kind, IdentityKind::Aci);
+    assert_eq!(local_service_id, ACI);
+}
