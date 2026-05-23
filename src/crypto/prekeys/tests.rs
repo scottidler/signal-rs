@@ -37,7 +37,7 @@ async fn linked_store() -> SqliteStore {
 async fn generate_batch_produces_records_in_memory_only() {
     let store = linked_store().await;
     let mut rng = ChaCha20Rng::seed_from_u64(7);
-    let batch = generate_batch(&mut rng, &store, 1).await.unwrap();
+    let batch = generate_batch(&mut rng, &store, IdentityKind::Aci, 1).await.unwrap();
 
     assert_eq!(batch.one_time_prekey_ids.len(), PREKEY_BATCH_SIZE as usize);
     assert_eq!(batch.one_time_prekey_ids[0], 1);
@@ -64,7 +64,7 @@ async fn persist_batch_writes_after_upload_success() {
     // records are visible via PreKeyStore::get_pre_key.
     let store = linked_store().await;
     let mut rng = ChaCha20Rng::seed_from_u64(11);
-    let batch = generate_batch(&mut rng, &store, 1).await.unwrap();
+    let batch = generate_batch(&mut rng, &store, IdentityKind::Aci, 1).await.unwrap();
     persist_batch(&store, &batch).await.unwrap();
 
     let first_id = PreKeyId::from(batch.one_time_prekey_ids[0]);
@@ -77,9 +77,11 @@ async fn persist_batch_writes_after_upload_success() {
 async fn second_batch_uses_disjoint_ids() {
     let store = linked_store().await;
     let mut rng = ChaCha20Rng::seed_from_u64(8);
-    let first = generate_batch(&mut rng, &store, 1).await.unwrap();
+    let first = generate_batch(&mut rng, &store, IdentityKind::Aci, 1).await.unwrap();
     let next_start = first.kyber_prekey_id + 1;
-    let second = generate_batch(&mut rng, &store, next_start).await.unwrap();
+    let second = generate_batch(&mut rng, &store, IdentityKind::Aci, next_start)
+        .await
+        .unwrap();
 
     let first_set: std::collections::HashSet<u32> = first.one_time_prekey_ids.iter().copied().collect();
     let second_set: std::collections::HashSet<u32> = second.one_time_prekey_ids.iter().copied().collect();
@@ -96,8 +98,8 @@ async fn upload_batch_against_missing_credentials_errors_without_polluting_store
     // no prekey row was written.
     let store = linked_store().await;
     let mut rng = ChaCha20Rng::seed_from_u64(9);
-    let batch = generate_batch(&mut rng, &store, 1).await.unwrap();
-    match upload_batch(&store, &batch).await {
+    let batch = generate_batch(&mut rng, &store, IdentityKind::Aci, 1).await.unwrap();
+    match upload_batch(&store, &batch, IdentityKind::Aci).await {
         Err(PrekeyError::Upload(msg)) => assert!(
             msg.contains("aci") || msg.contains("password") || msg.contains("missing"),
             "expected credential message, got {msg}"

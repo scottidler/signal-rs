@@ -21,7 +21,7 @@ use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::crypto::prekeys::GeneratedBatch;
+use crate::crypto::prekeys::{GeneratedBatch, IdentityKind};
 use crate::storage::{SqliteStore, Store, StoreError};
 
 /// Production Signal chat server. Staging is `chat.staging.signal.org` and
@@ -189,25 +189,50 @@ pub async fn complete_device_registration(
     Ok(device_id)
 }
 
-/// Upload a generated prekey batch under the ACI identity. Issues
-/// `PUT /v2/keys/?identity=aci` with HTTP Basic auth using
-/// `aci.device_id:password`. The body encodes the identity public key and
-/// all three prekey kinds (one-time, signed, kyber).
-pub async fn upload_keys_for_aci(store: &SqliteStore, batch: &GeneratedBatch) -> Result<(), ApiError> {
+/// Upload a generated prekey batch under the given identity (ACI or
+/// PNI). Issues `PUT /v2/keys/?identity={kind}` with HTTP Basic auth.
+/// The auth user is `{service_id}.{device_id}` where `service_id` is
+/// the ACI/PNI UUID for the identity being uploaded; the auth password
+/// is the same regardless of identity (one device password per device).
+/// The body's `identityKey` field is the public half of the keypair
+/// that signed this batch's signed-prekey and kyber-prekey.
+pub async fn upload_keys_for_identity(
+    store: &SqliteStore,
+    batch: &GeneratedBatch,
+    identity_kind: IdentityKind,
+) -> Result<(), ApiError> {
     let identity = store.load_identity().await?;
-    let aci = store.get_aci().await?.ok_or(ApiError::MissingCredential("aci"))?;
     let password = store
         .get_password()
         .await?
         .ok_or(ApiError::MissingCredential("password"))?;
 
-    let body = build_prekey_upload_body(store, &identity.identity_keypair, batch).await?;
+    // Pick the right identity keypair + service-id for the URL/auth.
+    let (signing_keypair, auth_service_id) = match identity_kind {
+        IdentityKind::Aci => {
+            let aci = store.get_aci().await?.ok_or(ApiError::MissingCredential("aci"))?;
+            (identity.identity_keypair, aci)
+        }
+        IdentityKind::Pni => {
+            let pni_kp = store
+                .get_pni_identity_keypair()
+                .await?
+                .ok_or(ApiError::MissingCredential("pni_identity_keypair"))?;
+            let pni = store.get_pni().await?.ok_or(ApiError::MissingCredential("pni"))?;
+            (pni_kp, pni)
+        }
+    };
 
-    let url = format!("{CHAT_BASE_URL}/v2/keys/?identity=aci");
-    let user = format!("{aci}.{}", identity.device_id);
+    let body = build_prekey_upload_body(store, &signing_keypair, batch).await?;
+
+    let url = format!("{CHAT_BASE_URL}/v2/keys/?identity={}", identity_kind.as_query_param());
+    let user = format!("{auth_service_id}.{}", identity.device_id);
     let auth_header = basic_auth_header(&user, &password);
 
-    debug!("upload_keys_for_aci: url={} user={}", url, user);
+    debug!(
+        "upload_keys_for_identity: identity={:?} url={} user={}",
+        identity_kind, url, user
+    );
 
     let client = http_client()?;
     let resp = client
@@ -227,7 +252,7 @@ pub async fn upload_keys_for_aci(store: &SqliteStore, batch: &GeneratedBatch) ->
         });
     }
 
-    info!("upload_keys_for_aci: status={}", status);
+    info!("upload_keys_for_identity: status={}", status);
     Ok(())
 }
 
@@ -378,7 +403,7 @@ mod tests {
         // reads them back from the store via the upload-body builder.
         // Persist directly for the test (skipping the upload that we
         // can't run without a live server).
-        let batch = generate_batch(&mut rng, &store, 1).await.unwrap();
+        let batch = generate_batch(&mut rng, &store, IdentityKind::Aci, 1).await.unwrap();
         crate::crypto::prekeys::persist_batch(&store, &batch).await.unwrap();
         let body = build_prekey_upload_body(&store, &identity, &batch).await.unwrap();
 

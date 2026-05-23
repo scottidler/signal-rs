@@ -15,6 +15,7 @@ use sqlx::{Row, SqlitePool};
 use super::{Identity, LinkStatus, Store, StoreError};
 
 const IDENTITY_KEY_KEYPAIR: &str = "identity_keypair";
+const IDENTITY_KEY_PNI_KEYPAIR: &str = "pni_identity_keypair";
 const IDENTITY_KEY_REGISTRATION_ID: &str = "registration_id";
 const IDENTITY_KEY_ACCOUNT_NUMBER: &str = "account_number";
 const IDENTITY_KEY_DEVICE_ID: &str = "device_id";
@@ -170,6 +171,23 @@ impl SqliteStore {
                     StoreError::Corrupt(format!("provisioning_code utf8: {e}"))
                 })?))
             }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the PNI identity keypair from the ProvisionMessage.
+    /// PNI keys are independent of ACI keys; signal-cli generates a
+    /// separate prekey batch per identity. Stored under a distinct key
+    /// from the (ACI) identity_keypair slot.
+    pub async fn set_pni_identity_keypair(&self, kp: &IdentityKeyPair) -> Result<(), StoreError> {
+        let bytes = kp.serialize();
+        self.put_identity_value(IDENTITY_KEY_PNI_KEYPAIR, &bytes).await
+    }
+
+    /// Load the PNI identity keypair, if persisted.
+    pub async fn get_pni_identity_keypair(&self) -> Result<Option<IdentityKeyPair>, StoreError> {
+        match self.get_identity_value(IDENTITY_KEY_PNI_KEYPAIR).await? {
+            Some(bytes) => Ok(Some(IdentityKeyPair::try_from(&bytes[..])?)),
             None => Ok(None),
         }
     }

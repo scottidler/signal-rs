@@ -27,7 +27,7 @@ use log::{debug, info};
 use thiserror::Error;
 use tokio::time::timeout;
 
-use crate::crypto::prekeys::{PrekeyError, generate_upload_persist, upload_batch};
+use crate::crypto::prekeys::{IdentityKind, PrekeyError, generate_upload_persist};
 use crate::crypto::provisioning::{ProvisioningKeyPair, decrypt_envelope, proto::ProvisionMessage};
 use crate::net::{Environment as NetEnv, NetError, connect_provisioning};
 use crate::storage::{LinkStatus, SqliteStore, Store, StoreError};
@@ -191,6 +191,18 @@ pub async fn persist_provision_message(store: &SqliteStore, msg: &ProvisionMessa
     }
     if let Some(pni) = &msg.pni {
         store.set_pni(pni).await?;
+    }
+    // PNI identity keypair - independent of ACI. Used to sign PNI-side
+    // prekey bundles. signal-cli generates separate prekey batches per
+    // identity; without the PNI keypair persisted, peers routing to us
+    // by phone-number identifier can't establish sessions.
+    if let (Some(pni_pub), Some(pni_priv)) = (&msg.pni_identity_key_public, &msg.pni_identity_key_private) {
+        let pni_identity_pub = libsignal_protocol::IdentityKey::decode(pni_pub)
+            .map_err(|e| LinkError::InvalidIdentityKey(format!("pni pub: {e}")))?;
+        let pni_identity_priv = libsignal_protocol::PrivateKey::deserialize(pni_priv)
+            .map_err(|e| LinkError::InvalidIdentityKey(format!("pni priv: {e}")))?;
+        let pni_keypair = IdentityKeyPair::new(pni_identity_pub, pni_identity_priv);
+        store.set_pni_identity_keypair(&pni_keypair).await?;
     }
     if let Some(profile_key) = &msg.profile_key {
         store.set_profile_key(profile_key).await?;
@@ -365,10 +377,18 @@ async fn drive_provisioning_handshake(
 async fn finish_prekey_upload(store: &SqliteStore, account_number: &str) -> Result<(), LinkError> {
     debug!("finish_prekey_upload: account={}", account_number);
     let mut rng = rand::rng();
-    // Initial upload starts at prekey id 1. Phase 8 replenishment will
-    // continue from the highest id already in the store.
-    let batch = generate_upload_persist(&mut rng, store, 1).await?;
-    upload_batch(store, &batch).await?;
+    // Initial upload: ACI keys first, then PNI keys (signal-cli does
+    // both during link). Each is its own batch with its own signing
+    // identity. Phase 8 replenishment will continue from the highest
+    // id already in the store, per identity. Both batches start at id
+    // 1 because they live in disjoint server-side pools.
+    generate_upload_persist(&mut rng, store, IdentityKind::Aci, 1).await?;
+    // PNI batch only if a PNI keypair was supplied by the primary.
+    if store.get_pni_identity_keypair().await?.is_some() {
+        generate_upload_persist(&mut rng, store, IdentityKind::Pni, 1).await?;
+    } else {
+        debug!("finish_prekey_upload: no PNI identity persisted, skipping PNI prekey upload");
+    }
     mark_linked(store).await?;
     info!("finish_prekey_upload: link_status -> Linked");
     Ok(())

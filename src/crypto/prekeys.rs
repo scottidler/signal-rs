@@ -23,6 +23,26 @@ pub const PREKEY_LOW_WATERMARK: u32 = 25;
 /// Number of one-time prekeys generated per replenishment batch.
 pub const PREKEY_BATCH_SIZE: u32 = 100;
 
+/// Which Signal identity a prekey batch belongs to. Signal accounts
+/// carry two: the ACI (account identifier UUID) and the PNI (phone-
+/// number identifier UUID). Each identity has its own keypair and its
+/// own prekey pool on the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityKind {
+    Aci,
+    Pni,
+}
+
+impl IdentityKind {
+    /// URL query-param value (`?identity=aci` vs `?identity=pni`).
+    pub fn as_query_param(self) -> &'static str {
+        match self {
+            IdentityKind::Aci => "aci",
+            IdentityKind::Pni => "pni",
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum PrekeyError {
     #[error("storage error: {0}")]
@@ -52,18 +72,29 @@ pub struct GeneratedBatch {
     pub kyber_prekey_id: u32,
 }
 
-/// Generate a fresh batch of prekeys in memory. Does NOT write to the
-/// store. The identity-key's private half signs the signed-prekey and
-/// kyber-prekey. IDs start at `next_id` and increase monotonically.
+/// Generate a fresh batch of prekeys in memory for the given identity.
+/// Does NOT write to the store. The identity's private half signs the
+/// signed-prekey and kyber-prekey. IDs start at `next_id` and increase
+/// monotonically.
 pub async fn generate_batch<R: rand::Rng + rand::CryptoRng>(
     rng: &mut R,
     store: &SqliteStore,
+    identity_kind: IdentityKind,
     next_id: u32,
 ) -> Result<GeneratedBatch, PrekeyError> {
-    debug!("generate_batch: next_id={} batch_size={}", next_id, PREKEY_BATCH_SIZE);
+    debug!(
+        "generate_batch: identity={:?} next_id={} batch_size={}",
+        identity_kind, next_id, PREKEY_BATCH_SIZE
+    );
 
-    let identity = store.load_identity().await?;
-    let signing_key = identity.identity_keypair.private_key();
+    let identity_keypair = match identity_kind {
+        IdentityKind::Aci => store.load_identity().await?.identity_keypair,
+        IdentityKind::Pni => store
+            .get_pni_identity_keypair()
+            .await?
+            .ok_or_else(|| PrekeyError::Storage(crate::storage::StoreError::NotLinked))?,
+    };
+    let signing_key = identity_keypair.private_key();
 
     // One-time prekeys
     let mut one_time_records = Vec::with_capacity(PREKEY_BATCH_SIZE as usize);
@@ -151,13 +182,16 @@ pub async fn persist_batch(store: &SqliteStore, batch: &GeneratedBatch) -> Resul
     Ok(())
 }
 
-/// Upload a generated batch to Signal's keyserver. Reads credentials
-/// (aci, password, device_id, identity keypair) from the store but
-/// reads the prekey records from `batch` (in memory) — does NOT touch
-/// the prekey tables.
-pub async fn upload_batch(store: &SqliteStore, batch: &GeneratedBatch) -> Result<(), PrekeyError> {
-    log::debug!("upload_batch: dispatching to api::upload_keys_for_aci");
-    crate::api::upload_keys_for_aci(store, batch)
+/// Upload a generated batch to Signal's keyserver under the given
+/// identity. Reads credentials (aci, password, device_id, identity
+/// keypair) from the store but reads the prekey records from `batch`.
+pub async fn upload_batch(
+    store: &SqliteStore,
+    batch: &GeneratedBatch,
+    identity_kind: IdentityKind,
+) -> Result<(), PrekeyError> {
+    log::debug!("upload_batch: identity={identity_kind:?}");
+    crate::api::upload_keys_for_identity(store, batch, identity_kind)
         .await
         .map_err(|e| match e {
             crate::api::ApiError::Storage(s) => PrekeyError::Store(s),
@@ -171,10 +205,11 @@ pub async fn upload_batch(store: &SqliteStore, batch: &GeneratedBatch) -> Result
 pub async fn generate_upload_persist<R: rand::Rng + rand::CryptoRng>(
     rng: &mut R,
     store: &SqliteStore,
+    identity_kind: IdentityKind,
     next_id: u32,
 ) -> Result<GeneratedBatch, PrekeyError> {
-    let batch = generate_batch(rng, store, next_id).await?;
-    upload_batch(store, &batch).await?;
+    let batch = generate_batch(rng, store, identity_kind, next_id).await?;
+    upload_batch(store, &batch, identity_kind).await?;
     persist_batch(store, &batch).await?;
     Ok(batch)
 }
