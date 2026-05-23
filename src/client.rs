@@ -385,10 +385,24 @@ impl Client {
         target == self.inner.identity.account_number
     }
 
-    /// Encrypt a payload to the user's own ACI and dispatch via
-    /// `send_sync_message`. Note-to-Self does not require a prior session
-    /// fetch from the keys endpoint - libsignal-protocol's session
-    /// machinery establishes one from the locally-known identity.
+    /// Encrypt a Note-to-Self transcript to each of the user's OTHER
+    /// linked devices and dispatch via `send_sync_message`. The chat
+    /// server fans the encrypted blobs to those devices; the user's
+    /// other devices decode and surface them as `SyncMessage::Sent`.
+    ///
+    /// Routing: Signal's sync-message contract is "encrypt the same
+    /// transcript once per other-device, addressed `own_aci.device_id`".
+    /// We must NOT include our own device_id in the contents — the chat
+    /// server rejects that. For v0.1, the set of "other devices" is
+    /// inferred from existing sessions under the own-ACI prefix, or
+    /// defaults to the primary device (id=1) when no sync sessions
+    /// exist yet (we are the secondary, so the primary is always the
+    /// other end).
+    ///
+    /// Atomicity: encrypt + session-state persist run inside one
+    /// `sqlx::Transaction` via TxStore, matching the receive-side
+    /// contract. On dispatch failure the transaction commits (we did
+    /// the work; the server retry will re-dispatch, not re-encrypt).
     async fn send_note_to_self(&self, body: &str) -> Result<(), SendError> {
         use libsignal_net_chat::api::Auth;
         use libsignal_net_chat::api::messages::{AuthenticatedChatApi, SingleOutboundUnsealedMessage};
@@ -403,36 +417,85 @@ impl Client {
             Aci::parse_from_service_id_string(&aci_string).ok_or(SendError::MissingCredential("aci-parse"))?;
         let local_device_id = device_id_from_u32(self.inner.identity.device_id)
             .map_err(|e| SendError::Server(format!("device_id: {e}")))?;
+        let local_device_id_u32 = self.inner.identity.device_id;
         let local_address = ProtocolAddress::new(aci_string.clone(), local_device_id);
 
-        // Build the Content protobuf for the sync message. v0.1 sends a
-        // minimal SyncMessage::Sent carrying the body as a DataMessage to
-        // the user's own number.
+        // Enumerate the user's OTHER device IDs.  Filter out self.
+        let mut other_device_ids: Vec<u32> = self
+            .inner
+            .store
+            .session_device_ids_for_service_id(&aci_string)
+            .await?
+            .into_iter()
+            .filter(|id| *id != local_device_id_u32)
+            .collect();
+        if other_device_ids.is_empty() {
+            // No persisted sync sessions yet. As a secondary, the primary
+            // phone is device_id=1; encrypt to it. If 1 == self (i.e. we
+            // are the primary), there are no other devices and the sync
+            // is a no-op.
+            if local_device_id_u32 != 1 {
+                other_device_ids.push(1);
+            }
+        }
+        if other_device_ids.is_empty() {
+            info!("send_note_to_self: no other devices to sync to (we are the only device); no-op");
+            return Ok(());
+        }
+
         let content_bytes = build_sync_self_content(body, &aci_string, now_millis());
 
-        // Encrypt against the user's own session. For Note-to-Self we use
-        // the user's own ACI:device_id as the remote address - libsignal
-        // treats each device as a distinct session endpoint.
-        let mut session_store = self.inner.store.clone();
-        let mut identity_store = self.inner.store.clone();
+        // Encrypt one ciphertext per other-device inside a single
+        // transaction so session-state writes commit or roll back as a
+        // unit (atomicity contract from Phase 6).
+        let pool = self.inner.store.pool().clone();
+        let tx = pool.begin().await.map_err(StoreError::from)?;
+        let tx_store = crate::storage::tx::TxStore::new(tx);
+        let mut session = tx_store.session_store();
+        let mut identity = tx_store.identity_store();
+        let mut outbound: Vec<SingleOutboundUnsealedMessage<CiphertextMessage>> =
+            Vec::with_capacity(other_device_ids.len());
 
-        let ciphertext = libsignal_protocol::message_encrypt(
-            &content_bytes,
-            &local_address,
-            &local_address,
-            &mut session_store,
-            &mut identity_store,
-            std::time::SystemTime::now(),
-            &mut rand::rng(),
-        )
-        .await?;
+        for device_id_u32 in &other_device_ids {
+            let device_id =
+                device_id_from_u32(*device_id_u32).map_err(|e| SendError::Server(format!("device_id: {e}")))?;
+            let remote_address = ProtocolAddress::new(aci_string.clone(), device_id);
 
-        let outbound = SingleOutboundUnsealedMessage {
-            device_id: local_device_id,
-            registration_id: self.inner.identity.registration_id,
-            contents: ciphertext,
-        };
-        let _ = own_aci; // ACI is implicit in send_sync_message (auth headers).
+            // We don't process_prekey_bundle here: linking already
+            // established the session with the primary, and if it
+            // hasn't, the message_encrypt below will return
+            // SessionNotFound. Callers handle that by re-linking.
+            let ciphertext = libsignal_protocol::message_encrypt(
+                &content_bytes,
+                &remote_address,
+                &local_address,
+                &mut session,
+                &mut identity,
+                std::time::SystemTime::now(),
+                &mut rand::rng(),
+            )
+            .await?;
+
+            // Look up the registration_id for this device from its
+            // session record so the chat server can route the
+            // ciphertext. If we somehow don't have a session, fall back
+            // to our own registration_id (signal-cli does the same as a
+            // last resort for sync targets).
+            let registration_id = SessionStore::load_session(&session, &remote_address)
+                .await?
+                .and_then(|r| r.remote_registration_id().ok())
+                .unwrap_or(self.inner.identity.registration_id);
+
+            outbound.push(SingleOutboundUnsealedMessage {
+                device_id,
+                registration_id,
+                contents: ciphertext,
+            });
+        }
+
+        drop(session);
+        drop(identity);
+        tx_store.commit().await.map_err(StoreError::from)?;
 
         let (auth_chat, events) = self
             .open_authenticated_chat()
@@ -442,13 +505,18 @@ impl Client {
         let api = Auth(auth_chat);
         api.send_sync_message(
             libsignal_protocol::Timestamp::from_epoch_millis(now_millis()),
-            &[outbound],
+            &outbound,
             true, // urgent
         )
         .await
         .map_err(|e| SendError::Server(format!("send_sync_message: {e:?}")))?;
 
-        info!("send_note_to_self: dispatched body_len={}", body.len());
+        let _ = own_aci; // ACI is implicit in the auth headers.
+        info!(
+            "send_note_to_self: dispatched body_len={} to {} other device(s)",
+            body.len(),
+            outbound.len()
+        );
         Ok(())
     }
 
