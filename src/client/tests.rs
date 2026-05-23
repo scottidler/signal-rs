@@ -97,12 +97,12 @@ async fn open_succeeds_on_linked_state_dir_and_exposes_account_number() {
 }
 
 #[tokio::test]
-async fn send_returns_live_send_not_implemented_until_phase_10() {
+async fn send_to_non_note_to_self_target_returns_target_unsupported() {
     let (tmp, _) = linked_state_dir().await;
     let client = Client::open(tmp.path()).await.unwrap();
     match client.send("+15555550199", "hello").await {
-        Err(SendError::LiveSendNotImplemented) => {}
-        other => panic!("expected LiveSendNotImplemented, got {:?}", other),
+        Err(SendError::TargetUnsupported(t)) => assert_eq!(t, "+15555550199"),
+        other => panic!("expected TargetUnsupported, got {:?}", other),
     }
 }
 

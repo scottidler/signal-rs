@@ -66,12 +66,6 @@ pub enum ReceiveError {
 
 #[derive(Error, Debug)]
 pub enum SendError {
-    #[error(
-        "live send is not yet wired up; \
-         Phase 10 manual smoke test will exercise libsignal-net-chat::AuthenticatedChatApi"
-    )]
-    LiveSendNotImplemented,
-
     #[error("device has been deauthorized")]
     Deauthorized,
 
@@ -80,6 +74,23 @@ pub enum SendError {
 
     #[error("libsignal-protocol error: {0}")]
     Signal(#[from] libsignal_protocol::SignalProtocolError),
+
+    #[error("libsignal-net connect error: {0}")]
+    Net(#[from] NetError),
+
+    #[error("send failed: {0}")]
+    Server(String),
+
+    #[error("missing credential in store: {0}")]
+    MissingCredential(&'static str),
+
+    #[error(
+        "non-Note-to-Self sends require E.164 -> ACI resolution via the \
+         attested CDSI service, which is out of scope for v0.1. Sending to \
+         the account's own number (Note-to-Self via send_sync_message) is \
+         supported. target={0}"
+    )]
+    TargetUnsupported(String),
 }
 
 /// The Signal client. One per state directory. Owns the SQLite pool
@@ -162,15 +173,90 @@ impl Client {
     /// Send a 1:1 text message. `target` is an E.164 number. Pass the
     /// account's own number to fan out a Note-to-Self.
     ///
-    /// **Returns `SendError::LiveSendNotImplemented` in v0.1.** Phase 10
-    /// wires this to libsignal-net-chat::AuthenticatedChatApi.
+    /// v0.1 supports the Note-to-Self path only: when `target` matches
+    /// the account's own E.164 number, the message is encrypted to the
+    /// user's own ACI and dispatched via
+    /// `AuthenticatedChatApi::send_sync_message`. Sending to any other
+    /// number requires resolving E.164 -> ACI via Signal's attested
+    /// CDSI service, which is out of scope for v0.1.
     pub async fn send(&self, target: &str, body: &str) -> Result<(), SendError> {
-        warn!(
-            "Client::send: target={} body_len={} - live send is Phase 10",
-            target,
-            body.len()
-        );
-        Err(SendError::LiveSendNotImplemented)
+        debug!("Client::send: target={} body_len={}", target, body.len());
+
+        if !self.is_note_to_self(target) {
+            return Err(SendError::TargetUnsupported(target.to_string()));
+        }
+        self.send_note_to_self(body).await
+    }
+
+    fn is_note_to_self(&self, target: &str) -> bool {
+        target == self.inner.identity.account_number
+    }
+
+    /// Encrypt a payload to the user's own ACI and dispatch via
+    /// `send_sync_message`. Note-to-Self does not require a prior session
+    /// fetch from the keys endpoint - libsignal-protocol's session
+    /// machinery establishes one from the locally-known identity.
+    async fn send_note_to_self(&self, body: &str) -> Result<(), SendError> {
+        use libsignal_net_chat::api::Auth;
+        use libsignal_net_chat::api::messages::{AuthenticatedChatApi, SingleOutboundUnsealedMessage};
+
+        let aci_string = self
+            .inner
+            .store
+            .get_aci()
+            .await?
+            .ok_or(SendError::MissingCredential("aci"))?;
+        let own_aci =
+            Aci::parse_from_service_id_string(&aci_string).ok_or(SendError::MissingCredential("aci-parse"))?;
+        let local_device_id = device_id_from_u32(self.inner.identity.device_id)
+            .map_err(|e| SendError::Server(format!("device_id: {e}")))?;
+        let local_address = ProtocolAddress::new(aci_string.clone(), local_device_id);
+
+        // Build the Content protobuf for the sync message. v0.1 sends a
+        // minimal SyncMessage::Sent carrying the body as a DataMessage to
+        // the user's own number.
+        let content_bytes = build_sync_self_content(body, &aci_string, now_millis());
+
+        // Encrypt against the user's own session. For Note-to-Self we use
+        // the user's own ACI:device_id as the remote address - libsignal
+        // treats each device as a distinct session endpoint.
+        let mut session_store = self.inner.store.clone();
+        let mut identity_store = self.inner.store.clone();
+
+        let ciphertext = libsignal_protocol::message_encrypt(
+            &content_bytes,
+            &local_address,
+            &local_address,
+            &mut session_store,
+            &mut identity_store,
+            std::time::SystemTime::now(),
+            &mut rand::rng(),
+        )
+        .await?;
+
+        let outbound = SingleOutboundUnsealedMessage {
+            device_id: local_device_id,
+            registration_id: self.inner.identity.registration_id,
+            contents: ciphertext,
+        };
+        let _ = own_aci; // ACI is implicit in send_sync_message (auth headers).
+
+        let (auth_chat, events) = self
+            .open_authenticated_chat()
+            .await
+            .map_err(|e| SendError::Server(format!("open auth chat: {e}")))?;
+        drop(events); // Receive-side listener channel is not used by send.
+        let api = Auth(auth_chat);
+        api.send_sync_message(
+            libsignal_protocol::Timestamp::from_epoch_millis(now_millis()),
+            &[outbound],
+            true, // urgent
+        )
+        .await
+        .map_err(|e| SendError::Server(format!("send_sync_message: {e:?}")))?;
+
+        info!("send_note_to_self: dispatched body_len={}", body.len());
+        Ok(())
     }
 
     /// Run the receive loop. Opens an authenticated chat WebSocket with
@@ -468,6 +554,65 @@ fn decode_sync_sent(bytes: &[u8]) -> Option<SentSlice> {
 
 #[allow(dead_code)]
 const RECEIVE_LOOP_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+
+/// Current epoch milliseconds. Wire protocol uses uint64 ms.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Build the inner Content protobuf for a Note-to-Self send: wraps the
+/// body as a DataMessage and tags it via SyncMessage::Sent so the
+/// receiver-side filter (`destination == own_number`) fires.
+fn build_sync_self_content(body: &str, own_destination: &str, timestamp: u64) -> Vec<u8> {
+    use prost::Message as _;
+
+    #[derive(prost::Message)]
+    struct MinimalDataMessage {
+        #[prost(string, optional, tag = "1")]
+        body: Option<String>,
+        #[prost(uint64, optional, tag = "3")]
+        timestamp: Option<u64>,
+    }
+    #[derive(prost::Message)]
+    struct MinimalSent {
+        #[prost(string, optional, tag = "7")]
+        destination_service_id: Option<String>,
+        #[prost(uint64, optional, tag = "2")]
+        timestamp: Option<u64>,
+        #[prost(bytes, optional, tag = "1")]
+        message: Option<Vec<u8>>,
+    }
+    #[derive(prost::Message)]
+    struct MinimalSyncMessage {
+        #[prost(bytes, optional, tag = "1")]
+        sent: Option<Vec<u8>>,
+    }
+    #[derive(prost::Message)]
+    struct MinimalContent {
+        #[prost(bytes, optional, tag = "2")]
+        sync_message: Option<Vec<u8>>,
+    }
+
+    let dm = MinimalDataMessage {
+        body: Some(body.to_string()),
+        timestamp: Some(timestamp),
+    };
+    let sent = MinimalSent {
+        destination_service_id: Some(own_destination.to_string()),
+        timestamp: Some(timestamp),
+        message: Some(dm.encode_to_vec()),
+    };
+    let sm = MinimalSyncMessage {
+        sent: Some(sent.encode_to_vec()),
+    };
+    let content = MinimalContent {
+        sync_message: Some(sm.encode_to_vec()),
+    };
+    content.encode_to_vec()
+}
 
 /// Convert a `u32` device id loaded from storage into libsignal's
 /// `DeviceId` (which is a NonZeroU8 underneath). Device ids issued by
