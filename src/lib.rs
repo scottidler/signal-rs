@@ -2,12 +2,14 @@
 #![deny(dead_code)]
 #![deny(unused_variables)]
 
+pub mod client;
 pub mod config;
 pub mod crypto;
 pub mod envelope;
 pub mod link;
 pub mod storage;
 
+pub use client::{Client, OpenError, ReceiveError, SendError};
 pub use config::Config;
 pub use envelope::{DataMessage, Envelope, SyncMessage};
 pub use link::{LinkError, LinkOutcome, finalize_link, mark_linked, persist_provision_message, prepare_link_session};
