@@ -393,19 +393,24 @@ impl Client {
     /// Routing: Signal's sync-message contract is "encrypt the same
     /// transcript once per other-device, addressed `own_aci.device_id`".
     /// We must NOT include our own device_id in the contents — the chat
-    /// server rejects that. For v0.1, the set of "other devices" is
-    /// inferred from existing sessions under the own-ACI prefix, or
-    /// defaults to the primary device (id=1) when no sync sessions
-    /// exist yet (we are the secondary, so the primary is always the
-    /// other end).
+    /// server rejects that.
+    ///
+    /// Device discovery: hot path uses persisted sessions under the
+    /// own-ACI prefix (filtered for !=self). If no sessions exist (cold
+    /// path on first Note-to-Self), we fetch ALL the user's device
+    /// bundles via `UnauthenticatedChatApi::get_pre_keys(own_aci,
+    /// AllDevices)`, authorized via the access-key derived from our
+    /// own profile-key. This matches signal-cli's behavior and ensures
+    /// we don't miss other secondary devices we haven't talked to yet.
     ///
     /// Atomicity: encrypt + session-state persist run inside one
     /// `sqlx::Transaction` via TxStore, matching the receive-side
-    /// contract. On dispatch failure the transaction commits (we did
-    /// the work; the server retry will re-dispatch, not re-encrypt).
+    /// contract.
     async fn send_note_to_self(&self, body: &str) -> Result<(), SendError> {
-        use libsignal_net_chat::api::Auth;
+        use libsignal_net_chat::api::keys::{DeviceSpecifier, UnauthenticatedChatApi};
         use libsignal_net_chat::api::messages::{AuthenticatedChatApi, SingleOutboundUnsealedMessage};
+        use libsignal_net_chat::api::{Auth, Unauth, UserBasedAuthorization};
+        use libsignal_protocol::ServiceId;
 
         let aci_string = self
             .inner
@@ -420,8 +425,8 @@ impl Client {
         let local_device_id_u32 = self.inner.identity.device_id;
         let local_address = ProtocolAddress::new(aci_string.clone(), local_device_id);
 
-        // Enumerate the user's OTHER device IDs.  Filter out self.
-        let mut other_device_ids: Vec<u32> = self
+        // Hot path: any persisted other-device sessions for own_aci.
+        let known_other_devices: Vec<u32> = self
             .inner
             .store
             .session_device_ids_for_service_id(&aci_string)
@@ -429,19 +434,54 @@ impl Client {
             .into_iter()
             .filter(|id| *id != local_device_id_u32)
             .collect();
-        if other_device_ids.is_empty() {
-            // No persisted sync sessions yet. As a secondary, the primary
-            // phone is device_id=1; encrypt to it. If 1 == self (i.e. we
-            // are the primary), there are no other devices and the sync
-            // is a no-op.
-            if local_device_id_u32 != 1 {
-                other_device_ids.push(1);
+
+        // Cold path: fetch bundles for all of our own devices via the
+        // authenticated-by-access-key endpoint and process them.
+        let bundles_to_process: Option<Vec<libsignal_protocol::PreKeyBundle>> = if known_other_devices.is_empty() {
+            let profile_key = self
+                .inner
+                .store
+                .get_profile_key()
+                .await?
+                .ok_or(SendError::MissingCredential("profile_key"))?;
+            let pk_bytes: [u8; zkgroup::PROFILE_KEY_LEN] = profile_key
+                .as_slice()
+                .try_into()
+                .map_err(|_| SendError::Server(format!("profile_key length {}", profile_key.len())))?;
+            let access_key = zkgroup::profiles::ProfileKey::create(pk_bytes).derive_access_key();
+
+            let (unauth_chat, unauth_events) = net::connect_chat_unauthenticated(NetEnv::Production)
+                .await
+                .map_err(|e| SendError::Server(format!("open unauth chat: {e}")))?;
+            drop(unauth_events);
+            let unauth = Unauth(unauth_chat);
+            let (_, bundles) = unauth
+                .get_pre_keys(
+                    UserBasedAuthorization::AccessKey(access_key),
+                    ServiceId::from(own_aci),
+                    DeviceSpecifier::AllDevices,
+                )
+                .await
+                .map_err(|e| SendError::Server(format!("get_pre_keys(self,AllDevices): {e:?}")))?;
+            unauth.0.disconnect().await;
+
+            // Filter out our own device_id - the server includes us in
+            // AllDevices, but we must NOT encrypt to self.
+            let bundles: Vec<libsignal_protocol::PreKeyBundle> = bundles
+                .into_iter()
+                .filter(|b| match b.device_id() {
+                    Ok(d) => u32::from(d) != local_device_id_u32,
+                    Err(_) => false,
+                })
+                .collect();
+            if bundles.is_empty() {
+                info!("send_note_to_self: no other devices to sync to (we are the only device); no-op");
+                return Ok(());
             }
-        }
-        if other_device_ids.is_empty() {
-            info!("send_note_to_self: no other devices to sync to (we are the only device); no-op");
-            return Ok(());
-        }
+            Some(bundles)
+        } else {
+            None
+        };
 
         let content_bytes = build_sync_self_content(body, &aci_string, now_millis());
 
@@ -453,44 +493,72 @@ impl Client {
         let tx_store = crate::storage::tx::TxStore::new(tx);
         let mut session = tx_store.session_store();
         let mut identity = tx_store.identity_store();
-        let mut outbound: Vec<SingleOutboundUnsealedMessage<CiphertextMessage>> =
-            Vec::with_capacity(other_device_ids.len());
+        let mut outbound: Vec<SingleOutboundUnsealedMessage<CiphertextMessage>> = Vec::new();
 
-        for device_id_u32 in &other_device_ids {
-            let device_id =
-                device_id_from_u32(*device_id_u32).map_err(|e| SendError::Server(format!("device_id: {e}")))?;
-            let remote_address = ProtocolAddress::new(aci_string.clone(), device_id);
+        if let Some(bundles) = bundles_to_process {
+            // Cold path: process each bundle into a session, then
+            // encrypt for that device.
+            for bundle in bundles.iter() {
+                let device_id = bundle.device_id().map_err(SendError::Signal)?;
+                let registration_id = bundle.registration_id().map_err(SendError::Signal)?;
+                let remote_address = ProtocolAddress::new(aci_string.clone(), device_id);
 
-            // We don't process_prekey_bundle here: linking already
-            // established the session with the primary, and if it
-            // hasn't, the message_encrypt below will return
-            // SessionNotFound. Callers handle that by re-linking.
-            let ciphertext = libsignal_protocol::message_encrypt(
-                &content_bytes,
-                &remote_address,
-                &local_address,
-                &mut session,
-                &mut identity,
-                std::time::SystemTime::now(),
-                &mut rand::rng(),
-            )
-            .await?;
+                libsignal_protocol::process_prekey_bundle(
+                    &remote_address,
+                    &local_address,
+                    &mut session,
+                    &mut identity,
+                    bundle,
+                    std::time::SystemTime::now(),
+                    &mut rand::rng(),
+                )
+                .await?;
 
-            // Look up the registration_id for this device from its
-            // session record so the chat server can route the
-            // ciphertext. If we somehow don't have a session, fall back
-            // to our own registration_id (signal-cli does the same as a
-            // last resort for sync targets).
-            let registration_id = SessionStore::load_session(&session, &remote_address)
-                .await?
-                .and_then(|r| r.remote_registration_id().ok())
-                .unwrap_or(self.inner.identity.registration_id);
+                let ciphertext = libsignal_protocol::message_encrypt(
+                    &content_bytes,
+                    &remote_address,
+                    &local_address,
+                    &mut session,
+                    &mut identity,
+                    std::time::SystemTime::now(),
+                    &mut rand::rng(),
+                )
+                .await?;
+                outbound.push(SingleOutboundUnsealedMessage {
+                    device_id,
+                    registration_id,
+                    contents: ciphertext,
+                });
+            }
+        } else {
+            // Hot path: encrypt against existing sessions.
+            for device_id_u32 in &known_other_devices {
+                let device_id =
+                    device_id_from_u32(*device_id_u32).map_err(|e| SendError::Server(format!("device_id: {e}")))?;
+                let remote_address = ProtocolAddress::new(aci_string.clone(), device_id);
 
-            outbound.push(SingleOutboundUnsealedMessage {
-                device_id,
-                registration_id,
-                contents: ciphertext,
-            });
+                let ciphertext = libsignal_protocol::message_encrypt(
+                    &content_bytes,
+                    &remote_address,
+                    &local_address,
+                    &mut session,
+                    &mut identity,
+                    std::time::SystemTime::now(),
+                    &mut rand::rng(),
+                )
+                .await?;
+
+                let registration_id = SessionStore::load_session(&session, &remote_address)
+                    .await?
+                    .and_then(|r| r.remote_registration_id().ok())
+                    .unwrap_or(self.inner.identity.registration_id);
+
+                outbound.push(SingleOutboundUnsealedMessage {
+                    device_id,
+                    registration_id,
+                    contents: ciphertext,
+                });
+            }
         }
 
         drop(session);
@@ -511,7 +579,6 @@ impl Client {
         .await
         .map_err(|e| SendError::Server(format!("send_sync_message: {e:?}")))?;
 
-        let _ = own_aci; // ACI is implicit in the auth headers.
         info!(
             "send_note_to_self: dispatched body_len={} to {} other device(s)",
             body.len(),
