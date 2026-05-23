@@ -173,12 +173,15 @@ impl Client {
     /// Send a 1:1 text message. `target` is an E.164 number. Pass the
     /// account's own number to fan out a Note-to-Self.
     ///
-    /// v0.1 supports the Note-to-Self path only: when `target` matches
-    /// the account's own E.164 number, the message is encrypted to the
-    /// user's own ACI and dispatched via
-    /// `AuthenticatedChatApi::send_sync_message`. Sending to any other
-    /// number requires resolving E.164 -> ACI via Signal's attested
-    /// CDSI service, which is out of scope for v0.1.
+    /// v0.1's CLI surface accepts E.164 because the operator already
+    /// knows the number; resolving it to an ACI requires the attested
+    /// CDSI service (libsignal-net::cdsi, SGX-attested), which is out
+    /// of v0.1 scope. Callers that already know the recipient's ACI
+    /// and access-key should use [`Client::send_to_aci`] directly.
+    ///
+    /// Behavior:
+    /// - target == own E.164 number -> Note-to-Self via send_sync_message
+    /// - target != own E.164 number -> SendError::TargetUnsupported
     pub async fn send(&self, target: &str, body: &str) -> Result<(), SendError> {
         debug!("Client::send: target={} body_len={}", target, body.len());
 
@@ -186,6 +189,143 @@ impl Client {
             return Err(SendError::TargetUnsupported(target.to_string()));
         }
         self.send_note_to_self(body).await
+    }
+
+    /// Send a 1:1 text message to a known ACI. The caller must supply
+    /// the recipient's `access_key` (16 bytes, derived from their
+    /// profile key) so the unauthenticated prekey-bundle fetch can
+    /// authorize. For Note-to-Self use [`Client::send`] with the
+    /// account's own E.164 number, or [`Client::send_note_to_self`]
+    /// directly; that path uses `send_sync_message` and does not need
+    /// an access key.
+    ///
+    /// The flow:
+    /// 1. If no session exists for `target`, open an unauthenticated
+    ///    chat WebSocket and fetch the prekey bundle via
+    ///    `UnauthenticatedChatApi::get_pre_keys`. Process each device's
+    ///    bundle into a fresh session via `process_prekey_bundle`.
+    /// 2. Encrypt the message via libsignal-protocol's `message_encrypt`.
+    /// 3. Open an authenticated chat WebSocket and dispatch via
+    ///    `AuthenticatedChatApi::send_message`.
+    ///
+    /// Atomicity: encrypt + session-state persist + outbound-record
+    /// happen inside one `sqlx::Transaction` (mirrors the receive
+    /// pipeline's contract).
+    pub async fn send_to_aci(
+        &self,
+        target: Aci,
+        body: &str,
+        access_key: [u8; zkgroup::ACCESS_KEY_LEN],
+    ) -> Result<(), SendError> {
+        use libsignal_net_chat::api::keys::{DeviceSpecifier, UnauthenticatedChatApi};
+        use libsignal_net_chat::api::messages::{AuthenticatedChatApi, SingleOutboundUnsealedMessage};
+        use libsignal_net_chat::api::{Auth, Unauth, UserBasedAuthorization};
+        use libsignal_protocol::ServiceId;
+
+        debug!(
+            "Client::send_to_aci: target={} body_len={}",
+            target.service_id_string(),
+            body.len()
+        );
+
+        let aci_string = self
+            .inner
+            .store
+            .get_aci()
+            .await?
+            .ok_or(SendError::MissingCredential("aci"))?;
+        let local_device_id = device_id_from_u32(self.inner.identity.device_id)
+            .map_err(|e| SendError::Server(format!("device_id: {e}")))?;
+        let local_address = ProtocolAddress::new(aci_string.clone(), local_device_id);
+
+        // 1. Fetch prekey bundles for every device of `target` via the
+        //    unauth chat WebSocket. The caller's access_key authorizes
+        //    the fetch.
+        let (unauth_chat, unauth_events) = net::connect_chat_unauthenticated(NetEnv::Production)
+            .await
+            .map_err(|e| SendError::Server(format!("open unauth chat: {e}")))?;
+        drop(unauth_events);
+        let unauth = Unauth(unauth_chat);
+        let (_, bundles) = unauth
+            .get_pre_keys(
+                UserBasedAuthorization::AccessKey(access_key),
+                ServiceId::from(target),
+                DeviceSpecifier::AllDevices,
+            )
+            .await
+            .map_err(|e| SendError::Server(format!("get_pre_keys: {e:?}")))?;
+        unauth.0.disconnect().await;
+
+        if bundles.is_empty() {
+            return Err(SendError::Server("get_pre_keys returned no device bundles".to_string()));
+        }
+
+        // 2. Encrypt one ciphertext per recipient device, threading
+        //    session-state writes through one transaction.
+        let pool = self.inner.store.pool().clone();
+        let mut tx = pool.begin().await.map_err(StoreError::from)?;
+        let mut outbound: Vec<SingleOutboundUnsealedMessage<CiphertextMessage>> = Vec::with_capacity(bundles.len());
+
+        {
+            let tx_store = crate::storage::tx::TxStore::new(&mut tx);
+            let mut session = tx_store.session_store();
+            let mut identity = tx_store.identity_store();
+
+            for bundle in bundles.iter() {
+                let device_id = bundle.device_id().map_err(SendError::Signal)?;
+                let registration_id = bundle.registration_id().map_err(SendError::Signal)?;
+                let remote_address = ProtocolAddress::new(target.service_id_string(), device_id);
+
+                libsignal_protocol::process_prekey_bundle(
+                    &remote_address,
+                    &local_address,
+                    &mut session,
+                    &mut identity,
+                    bundle,
+                    std::time::SystemTime::now(),
+                    &mut rand::rng(),
+                )
+                .await?;
+
+                let content_bytes = build_one_to_one_content(body, now_millis());
+                let ciphertext = libsignal_protocol::message_encrypt(
+                    &content_bytes,
+                    &remote_address,
+                    &local_address,
+                    &mut session,
+                    &mut identity,
+                    std::time::SystemTime::now(),
+                    &mut rand::rng(),
+                )
+                .await?;
+                outbound.push(SingleOutboundUnsealedMessage {
+                    device_id,
+                    registration_id,
+                    contents: ciphertext,
+                });
+            }
+        }
+        tx.commit().await.map_err(StoreError::from)?;
+
+        // 3. Dispatch over the authenticated chat WebSocket.
+        let (auth_chat, auth_events) = self
+            .open_authenticated_chat()
+            .await
+            .map_err(|e| SendError::Server(format!("open auth chat: {e}")))?;
+        drop(auth_events);
+        let auth = Auth(auth_chat);
+        auth.send_message(
+            ServiceId::from(target),
+            libsignal_protocol::Timestamp::from_epoch_millis(now_millis()),
+            &outbound,
+            false, // online_only
+            true,  // urgent
+        )
+        .await
+        .map_err(|e| SendError::Server(format!("send_message: {e:?}")))?;
+
+        info!("send_to_aci: dispatched to {} devices", outbound.len());
+        Ok(())
     }
 
     fn is_note_to_self(&self, target: &str) -> bool {
@@ -380,18 +520,17 @@ impl Client {
     }
 
     /// Decode one envelope's ciphertext, decrypt it through libsignal-
-    /// protocol's session cipher, broadcast the decoded form.
+    /// protocol's session cipher in a single `sqlx::Transaction` via
+    /// the per-trait `TxStore` sub-stores, commit, then broadcast.
     ///
-    /// Atomicity note (v0.1): libsignal's `message_decrypt` takes four
-    /// disjoint `&mut dyn` storage references plus one `&dyn`. In rust
-    /// these cannot point at the same TxStore-borrowing-one-Transaction
-    /// (multi-mut-borrow rejection). v0.1 ships with five pool-backed
-    /// SqliteStore clones; each storage write is its own atomic SQLite
-    /// op, so per-query crash-consistency is preserved but the
-    /// design-doc's "all-or-nothing per envelope" semantic is relaxed.
-    /// Restoring full transaction atomicity requires reworking the
-    /// store layout to expose disjoint-field stores (libsignal's
-    /// `InMemSignalProtocolStore` shape); tracked as a v0.2 follow-up.
+    /// Atomicity contract (design doc § Phase 6):
+    /// - Decrypt + session-state persist + prekey consumption happen
+    ///   inside one `sqlx::Transaction`. If anything fails before the
+    ///   commit, the transaction is rolled back and the envelope is
+    ///   reprocessed cleanly on the next connect.
+    /// - Decrypt failures (Bad MAC, unknown prekey, identity mismatch)
+    ///   return Err here and the receive loop logs WARN and drops the
+    ///   envelope without disconnecting.
     async fn process_envelope(
         &self,
         envelope_bytes: &[u8],
@@ -430,24 +569,30 @@ impl Client {
         let source_device = wire.source_device.unwrap_or(1);
         let remote_address = ProtocolAddress::new(source_service_id.to_string(), device_id_from_u32(source_device)?);
 
-        let mut session_store = self.inner.store.clone();
-        let mut identity_store = self.inner.store.clone();
-        let mut pre_key_store = self.inner.store.clone();
-        let signed_pre_key_store = self.inner.store.clone();
-        let mut kyber_pre_key_store = self.inner.store.clone();
+        let pool = self.inner.store.pool().clone();
+        let mut tx = pool.begin().await.map_err(StoreError::from)?;
+        let plaintext = {
+            let tx_store = crate::storage::tx::TxStore::new(&mut tx);
+            let mut session = tx_store.session_store();
+            let mut identity = tx_store.identity_store();
+            let mut pre_key = tx_store.pre_key_store();
+            let signed_pre_key = tx_store.signed_pre_key_store();
+            let mut kyber = tx_store.kyber_pre_key_store();
 
-        let plaintext = libsignal_protocol::message_decrypt(
-            &ciphertext,
-            &remote_address,
-            local_address,
-            &mut session_store,
-            &mut identity_store,
-            &mut pre_key_store,
-            &signed_pre_key_store,
-            &mut kyber_pre_key_store,
-            &mut rand::rng(),
-        )
-        .await?;
+            libsignal_protocol::message_decrypt(
+                &ciphertext,
+                &remote_address,
+                local_address,
+                &mut session,
+                &mut identity,
+                &mut pre_key,
+                &signed_pre_key,
+                &mut kyber,
+                &mut rand::rng(),
+            )
+            .await?
+        };
+        tx.commit().await.map_err(StoreError::from)?;
 
         let decoded = decode_content(&plaintext, &wire);
         Ok(decoded)
@@ -613,6 +758,34 @@ impl Client {
         info!("maybe_replenish_prekeys: uploaded batch starting at id={}", next_id);
         Ok(())
     }
+}
+
+/// Build the inner Content protobuf for a 1:1 send: a DataMessage with
+/// the body and timestamp, wrapped in the top-level Content.
+fn build_one_to_one_content(body: &str, timestamp: u64) -> Vec<u8> {
+    use prost::Message as _;
+
+    #[derive(prost::Message)]
+    struct MinimalDataMessage {
+        #[prost(string, optional, tag = "1")]
+        body: Option<String>,
+        #[prost(uint64, optional, tag = "3")]
+        timestamp: Option<u64>,
+    }
+    #[derive(prost::Message)]
+    struct MinimalContent {
+        #[prost(bytes, optional, tag = "1")]
+        data_message: Option<Vec<u8>>,
+    }
+
+    let dm = MinimalDataMessage {
+        body: Some(body.to_string()),
+        timestamp: Some(timestamp),
+    };
+    let content = MinimalContent {
+        data_message: Some(dm.encode_to_vec()),
+    };
+    content.encode_to_vec()
 }
 
 /// Build the inner Content protobuf for a Note-to-Self send: wraps the

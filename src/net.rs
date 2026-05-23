@@ -170,3 +170,16 @@ pub async fn connect_chat_authenticated(
     )
     .await
 }
+
+/// Open an unauthenticated chat WebSocket. Used by send paths that need
+/// to fetch a recipient's prekey bundle. Per-request authorization
+/// (access key / group token) is set on the individual requests; the
+/// connection itself reveals no sender identity.
+pub async fn connect_chat_unauthenticated(
+    env_kind: Environment,
+) -> Result<(ChatConnection, mpsc::UnboundedReceiver<ws::ListenerEvent>), NetError> {
+    let headers = ChatHeaders::Unauth(UnauthenticatedChatHeaders {
+        languages: Default::default(),
+    });
+    connect_endpoint(env_kind, CHAT_WEBSOCKET_PATH, Some(headers), "unauth-chat").await
+}

@@ -79,13 +79,25 @@ struct DeviceCompletionResponse {
 }
 
 /// JSON body for `PUT /v2/keys/?identity=aci|pni`. Wire-format mirrors what
-/// `libsignal-net-chat::ws::keys`'s deserialize side parses on the GET path.
+/// `libsignal-net-chat::ws::keys`'s deserialize side parses on the GET path,
+/// cross-checked against `libsignal-net-chat::ws::registration::request`'s
+/// camelCase field names (`identityKey`, `signedPreKey`,
+/// `pqLastResortPreKey`).
+///
+/// Fields that may legitimately be absent for a given upload (e.g. no
+/// new one-time pq prekeys) are `Option`/`skip_if_empty` rather than
+/// empty-array-emitting; Signal's server rejects empty arrays for slots
+/// it expects to be omitted.
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct PreKeyUploadBody {
     identity_key: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pre_keys: Vec<PreKeyJson>,
     signed_pre_key: SignedPreKeyJson,
+    /// One-time post-quantum prekeys. v0.1 generates only the
+    /// last-resort PQ key, so this is normally empty and omitted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pq_pre_keys: Vec<KyberPreKeyJson>,
     pq_last_resort_pre_key: KyberPreKeyJson,
 }
@@ -339,5 +351,48 @@ mod tests {
         let encoded = b64(raw);
         let decoded = base64::engine::general_purpose::STANDARD.decode(&encoded).unwrap();
         assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn prekey_upload_body_serializes_to_expected_camel_case_shape() {
+        // Snapshot test: pin the wire shape so any future field rename
+        // or casing drift fails CI rather than silently breaking the
+        // live upload. Cross-check field names against signal-cli /
+        // libsignal's registration request body.
+        let body = PreKeyUploadBody {
+            identity_key: "AAEC".to_string(),
+            pre_keys: vec![
+                PreKeyJson {
+                    key_id: 1,
+                    public_key: "AAAA".to_string(),
+                },
+                PreKeyJson {
+                    key_id: 2,
+                    public_key: "BBBB".to_string(),
+                },
+            ],
+            signed_pre_key: SignedPreKeyJson {
+                key_id: 101,
+                public_key: "CCCC".to_string(),
+                signature: "DDDD".to_string(),
+            },
+            pq_pre_keys: Vec::new(), // empty -> field should be omitted
+            pq_last_resort_pre_key: KyberPreKeyJson {
+                key_id: 102,
+                public_key: "EEEE".to_string(),
+                signature: "FFFF".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        let expected = concat!(
+            r#"{"identityKey":"AAEC","#,
+            r#""preKeys":[{"keyId":1,"publicKey":"AAAA"},{"keyId":2,"publicKey":"BBBB"}],"#,
+            r#""signedPreKey":{"keyId":101,"publicKey":"CCCC","signature":"DDDD"},"#,
+            r#""pqLastResortPreKey":{"keyId":102,"publicKey":"EEEE","signature":"FFFF"}}"#,
+        );
+        assert_eq!(json, expected, "wire shape drift detected");
+        // Explicitly verify pqPreKeys is omitted (not emitted as []),
+        // since Signal's server rejects empty arrays for absent slots.
+        assert!(!json.contains("pqPreKeys"), "empty pqPreKeys must be omitted");
     }
 }
