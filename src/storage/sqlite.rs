@@ -184,6 +184,30 @@ impl SqliteStore {
             .await?;
         Ok(())
     }
+
+    /// Return the device IDs for which we already hold a session under
+    /// the given ACI/PNI string (i.e. all addresses formatted as
+    /// `{service_id}.{device_id}` whose service_id matches). Used by
+    /// the send path to skip prekey-bundle fetch (and the consumption
+    /// of the recipient's one-time prekeys) when we already have
+    /// established sessions for the target.
+    pub async fn session_device_ids_for_service_id(&self, service_id_string: &str) -> Result<Vec<u32>, StoreError> {
+        let prefix = format!("{service_id_string}.");
+        let rows = sqlx::query("SELECT address FROM sessions WHERE address LIKE ?")
+            .bind(format!("{prefix}%"))
+            .fetch_all(&self.pool)
+            .await?;
+        let mut ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            let addr: String = row.get("address");
+            if let Some(suffix) = addr.strip_prefix(&prefix)
+                && let Ok(id) = suffix.parse::<u32>()
+            {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
 }
 
 #[async_trait(?Send)]

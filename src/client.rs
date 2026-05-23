@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use libsignal_net::chat::server_requests::ServerEvent;
 use libsignal_net::chat::{AuthenticatedChatHeaders, ChatConnection, LanguageList, ReceiveStories};
-use libsignal_protocol::{Aci, CiphertextMessage, DeviceId, PreKeySignalMessage, ProtocolAddress, SignalMessage};
+use libsignal_protocol::{
+    Aci, CiphertextMessage, DeviceId, PreKeySignalMessage, ProtocolAddress, SessionStore, SignalMessage,
+};
 use log::{debug, info, warn};
 use prost::Message as _;
 use thiserror::Error;
@@ -238,27 +240,43 @@ impl Client {
             .map_err(|e| SendError::Server(format!("device_id: {e}")))?;
         let local_address = ProtocolAddress::new(aci_string.clone(), local_device_id);
 
-        // 1. Fetch prekey bundles for every device of `target` via the
-        //    unauth chat WebSocket. The caller's access_key authorizes
-        //    the fetch.
-        let (unauth_chat, unauth_events) = net::connect_chat_unauthenticated(NetEnv::Production)
-            .await
-            .map_err(|e| SendError::Server(format!("open unauth chat: {e}")))?;
-        drop(unauth_events);
-        let unauth = Unauth(unauth_chat);
-        let (_, bundles) = unauth
-            .get_pre_keys(
-                UserBasedAuthorization::AccessKey(access_key),
-                ServiceId::from(target),
-                DeviceSpecifier::AllDevices,
-            )
-            .await
-            .map_err(|e| SendError::Server(format!("get_pre_keys: {e:?}")))?;
-        unauth.0.disconnect().await;
+        // 1. Check whether we already hold any session for the target's
+        //    ACI. If we do, skip the unauthenticated `get_pre_keys`
+        //    fetch entirely — fetching consumes a one-time prekey from
+        //    the recipient's server-side pool, so repeatedly sending to
+        //    a known recipient would burn through their prekeys.
+        //    Per the design doc: "If no session exists for the target,
+        //    fetch their prekey bundle".
+        let target_service_id_string = target.service_id_string();
+        let known_device_ids = self
+            .inner
+            .store
+            .session_device_ids_for_service_id(&target_service_id_string)
+            .await?;
 
-        if bundles.is_empty() {
-            return Err(SendError::Server("get_pre_keys returned no device bundles".to_string()));
-        }
+        let bundles_to_process: Option<Vec<libsignal_protocol::PreKeyBundle>> = if known_device_ids.is_empty() {
+            // Cold path: no sessions yet. Fetch all device bundles.
+            let (unauth_chat, unauth_events) = net::connect_chat_unauthenticated(NetEnv::Production)
+                .await
+                .map_err(|e| SendError::Server(format!("open unauth chat: {e}")))?;
+            drop(unauth_events);
+            let unauth = Unauth(unauth_chat);
+            let (_, bundles) = unauth
+                .get_pre_keys(
+                    UserBasedAuthorization::AccessKey(access_key),
+                    ServiceId::from(target),
+                    DeviceSpecifier::AllDevices,
+                )
+                .await
+                .map_err(|e| SendError::Server(format!("get_pre_keys: {e:?}")))?;
+            unauth.0.disconnect().await;
+            if bundles.is_empty() {
+                return Err(SendError::Server("get_pre_keys returned no device bundles".to_string()));
+            }
+            Some(bundles)
+        } else {
+            None
+        };
 
         // 2. Encrypt one ciphertext per recipient device, threading
         //    session-state writes through one transaction. TxStore owns
@@ -268,40 +286,75 @@ impl Client {
         let tx_store = crate::storage::tx::TxStore::new(tx);
         let mut session = tx_store.session_store();
         let mut identity = tx_store.identity_store();
-        let mut outbound: Vec<SingleOutboundUnsealedMessage<CiphertextMessage>> = Vec::with_capacity(bundles.len());
+        let mut outbound: Vec<SingleOutboundUnsealedMessage<CiphertextMessage>> = Vec::new();
 
-        for bundle in bundles.iter() {
-            let device_id = bundle.device_id().map_err(SendError::Signal)?;
-            let registration_id = bundle.registration_id().map_err(SendError::Signal)?;
-            let remote_address = ProtocolAddress::new(target.service_id_string(), device_id);
+        if let Some(bundles) = bundles_to_process {
+            // Cold path: process each fetched bundle into a session, then
+            // encrypt for that device.
+            for bundle in bundles.iter() {
+                let device_id = bundle.device_id().map_err(SendError::Signal)?;
+                let registration_id = bundle.registration_id().map_err(SendError::Signal)?;
+                let remote_address = ProtocolAddress::new(target_service_id_string.clone(), device_id);
 
-            libsignal_protocol::process_prekey_bundle(
-                &remote_address,
-                &local_address,
-                &mut session,
-                &mut identity,
-                bundle,
-                std::time::SystemTime::now(),
-                &mut rand::rng(),
-            )
-            .await?;
+                libsignal_protocol::process_prekey_bundle(
+                    &remote_address,
+                    &local_address,
+                    &mut session,
+                    &mut identity,
+                    bundle,
+                    std::time::SystemTime::now(),
+                    &mut rand::rng(),
+                )
+                .await?;
 
-            let content_bytes = build_one_to_one_content(body, now_millis());
-            let ciphertext = libsignal_protocol::message_encrypt(
-                &content_bytes,
-                &remote_address,
-                &local_address,
-                &mut session,
-                &mut identity,
-                std::time::SystemTime::now(),
-                &mut rand::rng(),
-            )
-            .await?;
-            outbound.push(SingleOutboundUnsealedMessage {
-                device_id,
-                registration_id,
-                contents: ciphertext,
-            });
+                let content_bytes = build_one_to_one_content(body, now_millis());
+                let ciphertext = libsignal_protocol::message_encrypt(
+                    &content_bytes,
+                    &remote_address,
+                    &local_address,
+                    &mut session,
+                    &mut identity,
+                    std::time::SystemTime::now(),
+                    &mut rand::rng(),
+                )
+                .await?;
+                outbound.push(SingleOutboundUnsealedMessage {
+                    device_id,
+                    registration_id,
+                    contents: ciphertext,
+                });
+            }
+        } else {
+            // Hot path: encrypt against existing sessions, no bundle
+            // fetch. If the recipient added a new device since we last
+            // talked, send_message will return MismatchedDevices and the
+            // caller can retry with a fresh fetch.
+            for device_id_u32 in &known_device_ids {
+                let device_id =
+                    device_id_from_u32(*device_id_u32).map_err(|e| SendError::Server(format!("device_id: {e}")))?;
+                let remote_address = ProtocolAddress::new(target_service_id_string.clone(), device_id);
+                let session_record = SessionStore::load_session(&session, &remote_address)
+                    .await?
+                    .ok_or_else(|| SendError::Server(format!("session row for device {device_id} disappeared")))?;
+                let registration_id = session_record.remote_registration_id().map_err(SendError::Signal)?;
+
+                let content_bytes = build_one_to_one_content(body, now_millis());
+                let ciphertext = libsignal_protocol::message_encrypt(
+                    &content_bytes,
+                    &remote_address,
+                    &local_address,
+                    &mut session,
+                    &mut identity,
+                    std::time::SystemTime::now(),
+                    &mut rand::rng(),
+                )
+                .await?;
+                outbound.push(SingleOutboundUnsealedMessage {
+                    device_id,
+                    registration_id,
+                    contents: ciphertext,
+                });
+            }
         }
         drop(session);
         drop(identity);
