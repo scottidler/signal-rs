@@ -91,6 +91,53 @@ async fn second_batch_uses_disjoint_ids() {
 }
 
 #[tokio::test]
+async fn generate_persist_load_round_trip_per_identity() {
+    // The collision-prevention guarantee at the crypto layer: generate
+    // an ACI batch starting at next_id=1, generate a PNI batch ALSO
+    // starting at next_id=1, persist both, and assert the records at
+    // id=101 (the signed-prekey slot for batches of size 100) load
+    // back correctly from each identity's scoped store.
+    use libsignal_protocol::{GenericSignedPreKey, SignedPreKeyId, SignedPreKeyStore};
+
+    let store = linked_store().await;
+    // Also persist a PNI keypair so generate_batch(Pni, _) can sign.
+    let pni_kp = IdentityKeyPair::generate(&mut ChaCha20Rng::seed_from_u64(13));
+    store.set_pni_identity_keypair(&pni_kp).await.unwrap();
+
+    let mut rng = ChaCha20Rng::seed_from_u64(0xACE);
+    let aci_batch = generate_batch(&mut rng, &store, IdentityKind::Aci, 1).await.unwrap();
+    let pni_batch = generate_batch(&mut rng, &store, IdentityKind::Pni, 1).await.unwrap();
+    assert_eq!(aci_batch.signed_prekey_id, 101);
+    assert_eq!(pni_batch.signed_prekey_id, 101);
+
+    persist_batch(&store, &aci_batch, IdentityKind::Aci).await.unwrap();
+    persist_batch(&store, &pni_batch, IdentityKind::Pni).await.unwrap();
+
+    let signed_id_101 = SignedPreKeyId::from(101u32);
+    let aci_scoped = store.scoped(IdentityKind::Aci);
+    let pni_scoped = store.scoped(IdentityKind::Pni);
+    let aci_loaded = SignedPreKeyStore::get_signed_pre_key(&aci_scoped, signed_id_101)
+        .await
+        .unwrap();
+    let pni_loaded = SignedPreKeyStore::get_signed_pre_key(&pni_scoped, signed_id_101)
+        .await
+        .unwrap();
+    assert_eq!(
+        aci_loaded.serialize().unwrap(),
+        aci_batch.signed_record.serialize().unwrap()
+    );
+    assert_eq!(
+        pni_loaded.serialize().unwrap(),
+        pni_batch.signed_record.serialize().unwrap()
+    );
+    assert_ne!(
+        aci_loaded.serialize().unwrap(),
+        pni_loaded.serialize().unwrap(),
+        "the bug was that load(id=101) returned the same (PNI) record for both scopes"
+    );
+}
+
+#[tokio::test]
 async fn generate_upload_persist_rolls_back_local_writes_on_upload_failure() {
     // Architect round 3: the persist-after-upload ordering has a
     // post-upload local-failure hole. The fix is transactional: open

@@ -130,10 +130,12 @@ SQL row layout.
   one-time (the `used` column is set but `mark_kyber_pre_key_used`
   deletes the row). Last-resort handling is a separate v0.2 item.
 - Encrypted device-name display. Cosmetic; a separate v0.2 item.
-- A `migrations/test_data/` fixture verifying that 0002 applies
-  cleanly to a 0001-shaped DB. With only two migration files, the
-  failure modes are covered by the existing in-memory store tests;
-  add the fixture when `migrations/` grows past three files.
+- A `migrations/test_data/` fixture verifying schema upgrades apply
+  cleanly. With only `0001_initial.sql` in tree (the per-identity
+  scoping was folded into 0001 rather than added as a separate
+  migration), the failure modes are covered by the existing
+  in-memory store tests; add the fixture when `migrations/` grows
+  past three files.
 
 ## Proposed Solution
 
@@ -186,25 +188,23 @@ today; the only change is that the SQL gains a `WHERE identity_kind =
 
 ### Data Model
 
-Schema migration lives in `migrations/0002_per_identity_prekeys.sql`.
-It drops and recreates the three prekey tables with a composite primary
-key. The `identity` table needs no DDL change: it is already a flat
+**As shipped:** the new schema was folded directly into
+`migrations/0001_initial.sql` rather than added as a separate `0002`
+migration. signal-rs is pre-v0.1, every smoke run wipes state via
+`bin/relink`, so the additional migration file had no operational
+value. The `identity` table needs no DDL change: it is already a flat
 KV. The PNI registration id is persisted as a new KV row keyed
 `'pni_registration_id'`, alongside the existing `'identity_keypair'`,
 `'pni_identity_keypair'`, and `'registration_id'` rows. The scoping
 for both the keypair lookup and the registration-id lookup is purely
 in the trait impl.
 
-```sql
--- 0002_per_identity_prekeys.sql
---
--- Re-creates the prekey tables with a composite (identity_kind, id)
--- primary key. Any pre-existing rows are dropped; callers on a v0.1
--- state directory must re-link after this migration runs.
+The final schema (with `(identity_kind, id)` composite primary key
+and CHECK constraint) is exactly what the original 0002 design
+described, just landed in 0001:
 
-DROP TABLE IF EXISTS prekeys;
-DROP TABLE IF EXISTS signed_prekeys;
-DROP TABLE IF EXISTS kyber_prekeys;
+```sql
+-- migrations/0001_initial.sql (relevant excerpt)
 
 CREATE TABLE prekeys (
     identity_kind TEXT NOT NULL CHECK (identity_kind IN ('aci', 'pni')),
@@ -466,7 +466,10 @@ required edit is removing the `other` skip arm at `src/client.rs:763`.
 #### Phase 1: Schema and the scoped store
 **Model:** sonnet
 
-- Add `migrations/0002_per_identity_prekeys.sql` per the schema above.
+- Update `migrations/0001_initial.sql` to define the prekey tables
+  with the `(identity_kind, id)` composite PK directly. (Originally
+  planned as a separate `0002` migration; consolidated into 0001
+  because signal-rs is pre-v0.1 and every smoke wipes state.)
 - Add `IdentityKind::as_db_str()` in `src/crypto/prekeys.rs`.
 - Add `IdentityScopedStore` in `src/storage/sqlite.rs` with the four
   libsignal trait impls.
@@ -481,8 +484,10 @@ required edit is removing the `other` skip arm at `src/client.rs:763`.
     - Add `aci_and_pni_prekey_at_same_id_round_trip_independently`,
       `aci_and_pni_signed_prekey_at_same_id_round_trip_independently`,
       and `aci_and_pni_kyber_prekey_at_same_id_round_trip_independently`.
-    - Add `identity_scoped_store_returns_correct_keypair_per_kind`.
-    - Add `identity_scoped_store_returns_correct_registration_id_per_kind`.
+    - Add `identity_scoped_store_aci_returns_aci_keypair_and_reg_id`
+      and `identity_scoped_store_pni_returns_pni_keypair_and_reg_id`
+      (split by identity rather than by field; each test covers both
+      the keypair and the registration id for its scope).
     - Adapt or remove existing tests that exercised the deleted
       `SqliteStore` impls so they go through the scoped store.
 
@@ -506,8 +511,9 @@ Acceptance: `otto ci` green.
   siblings; they are unused and become misleading.
 - Update `src/storage/tx/tests.rs`:
     - Add `tx_pre_key_consumption_respects_identity_kind`.
-    - Add `tx_identity_keypair_returns_pni_when_scoped_pni`.
-    - Add `tx_registration_id_returns_pni_value_when_scoped_pni`.
+    - Add `tx_identity_keypair_returns_pni_when_scoped_pni` (combined:
+      asserts both keypair and registration id come back correctly
+      from each scope's TxStore sub-store).
 
 Acceptance: `otto ci` green.
 
@@ -539,26 +545,48 @@ Acceptance: `otto ci` green; `cargo install --path .`.
 **Model:** opus
 
 - Add `src/link/tests.rs::link_persists_aci_and_pni_batches_without_collision`:
-  drive `finalize_after_persist` against a fake server (or a
-  unit-friendly equivalent); after it returns, assert both
-  `(identity_kind='aci', id=101)` and `(identity_kind='pni', id=101)`
-  exist in `signed_prekeys` with the correct serialised records, and
-  that `'pni_registration_id'` is persisted and differs from
-  `'registration_id'`.
+  exercises the prekey-persistence sub-sequence of
+  `finalize_after_persist` end to end (the design originally called
+  for a fake-server harness; the live `/v1/devices/link` PUT cannot
+  be unit-tested, so the test calls the same `generate_batch` /
+  `set_pni_registration_id` / `persist_batch` sequence the production
+  function does and asserts both signed-prekey rows at id=101 survive
+  with the correct private halves, plus that the two registration
+  ids are independently generated). The full server round-trip is
+  covered by the Phase 5 smoke.
 - Add `src/crypto/prekeys/tests.rs::generate_persist_load_round_trip_per_identity`:
   generate ACI batch with `next_id=1`, generate PNI batch with
   `next_id=1`, persist both, load `id=101` through each scoped store,
   assert each matches the right batch's `signed_record`.
-- Add `src/client/tests.rs::process_envelope_routes_pni_destination_to_pni_scoped_stores`:
-  construct a synthetic CIPHERTEXT envelope with
-  `destination_service_id` set to a stored PNI string; instrument the
-  decrypt path (a recording fake under the scoped traits, or a
-  pre-seeded session that proves which scope was queried); assert the
-  PNI prekey row is consumed and the ACI row is not. This is the
-  unit-level proxy for the PNI receive path that the Phase 5 user
-  smoke is not guaranteed to exercise.
+- Add unit-level coverage for `process_envelope`'s destination-based
+  routing decision. The original plan called for synthesising a
+  CIPHERTEXT envelope and driving it through `process_envelope` with
+  a recording fake. That requires a full pre-established session
+  fixture (libsignal-protocol's `process_prekey_bundle` +
+  `message_encrypt` against scoped sub-stores) which is substantial
+  fixture work. As shipped, the routing decision was extracted into
+  a pure free function `route_envelope_to_identity` in `client.rs`
+  and exhaustively tested in `src/client/tests.rs`:
+    - `route_pni_destination_routes_to_pni_scope`
+    - `route_aci_destination_routes_to_aci_scope`
+    - `route_missing_destination_defaults_to_aci`
+    - `route_unknown_destination_defaults_to_aci`
+    - `route_pni_destination_without_local_pni_falls_through_to_aci`
+    - `route_aci_destination_works_without_local_pni`
 
-Acceptance: all three tests fail before Phases 1 to 3 land and pass after.
+  Combined with `tx_pre_key_consumption_respects_identity_kind` (which
+  proves the scoped sub-stores filter correctly under a real
+  transaction) and `tx_identity_keypair_returns_pni_when_scoped_pni`
+  (which proves the identity-keypair branch), the wiring between
+  envelope-to-kind decision and prekey-row consumption is covered at
+  both sides; the only uncovered link is the inline
+  `tx_store.pre_key_store(kind)` call inside `process_envelope` itself.
+  That call is a 1-line passthrough of `identity_kind`; the design
+  accepts this as a remaining test gap to be revisited if a regression
+  appears.
+
+Acceptance: all the above tests fail before the structural fix lands
+and pass after.
 
 #### Phase 5: Smoke and ship
 **Model:** opus
@@ -574,10 +602,11 @@ Caveat: typical primary-to-linked traffic (text messages,
 SyncMessages from the primary device) is ACI-addressed. A passing
 smoke shows the ACI path works; it does NOT prove the PNI path
 works. The PNI path's correctness is established by the Phase 4
-`process_envelope_routes_pni_destination_to_pni_scoped_stores` test.
+`route_*` tests in `src/client/tests.rs` plus the tx-level
+identity-scoping tests, not by Phase 5.
 
 Acceptance: phone-to-signal-rs message round-trip works without MAC
-failure, AND the Phase 4 PNI routing test passes.
+failure, AND the Phase 4 routing tests pass.
 
 ## Alternatives Considered
 
@@ -688,7 +717,7 @@ important new test.
 | `destination_service_id` is absent or malformed on real envelopes | Low | Medium | Routing rule defaults to ACI for missing/unknown destinations, matching pre-multi-identity behaviour. Add a `warn!` log when this branch is taken so unusual envelopes show up at DEBUG. |
 | Drop-and-recreate migration runs against a populated state dir we did not anticipate | Low | Medium | Documented in release notes. The dev machine wipes via `bin/relink` every cycle. No production users yet. |
 | `IdentityKeyStore` scoping breaks ACI flows we have not exercised (e.g. send-to-PNI peer) | Medium | Medium | Phase 4's integration test exercises both identities through link; Phase 5's smoke covers the receive path; the send path's prekey-bundle fetch (`session_device_ids_for_service_id`) already operates against an explicit service id and is unchanged. |
-| Smoke test (Phase 5) silently passes on the ACI happy path, masking a residual PNI bug | High | Medium | Phase 4 adds `process_envelope_routes_pni_destination_to_pni_scoped_stores` as the unit-level proxy for the PNI receive path; Phase 5 acceptance requires both that test and the user smoke to pass. |
+| Smoke test (Phase 5) silently passes on the ACI happy path, masking a residual PNI bug | High | Medium | Phase 4 ships six `route_*` tests in `src/client/tests.rs` plus identity-scoped tx tests as the unit-level proxy for the PNI receive path; Phase 5 acceptance requires both those tests and the user smoke to pass. |
 | Pool-backed and transaction-backed scoped impls drift over time | Low | Medium | Phase 2 hoists each SQL query to a module-level `const` so both impls reference the same string; a future query change must touch both call sites at once. |
 | Composite PK changes alter index plans in sqlite enough to slow a hot query | Very low | Low | The hot query is point lookup by `(identity_kind, id)`, which is the PK; sqlite uses the PK index trivially. |
 

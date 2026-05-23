@@ -210,3 +210,76 @@ async fn finalize_link_with_tampered_envelope_fails_at_mac_and_does_not_persist(
 // phone scan; Phase 10's manual smoke test covers it. The
 // `persist_provision_message` / `finalize_link` integration tests above
 // exercise the post-decrypt path with synthesized envelopes.
+
+#[tokio::test]
+async fn link_persists_aci_and_pni_batches_without_collision() {
+    // This is the integration test required by the per-identity-prekey
+    // design doc. The full `finalize_after_persist` path issues a live
+    // /v1/devices/link PUT, which we cannot exercise without a server.
+    // What we CAN exercise (and what the design cares about for the
+    // collision-prevention guarantee) is the local persistence
+    // sub-sequence: generate ACI + PNI batches starting at id=1,
+    // generate a distinct PNI registration id, persist both batches
+    // and the PNI reg id; then assert both signed-prekey rows at
+    // id=101 survive in their own (identity_kind, id) partitions and
+    // the two registration ids differ.
+    use crate::crypto::prekeys::{IdentityKind, generate_batch, persist_batch};
+    use libsignal_protocol::{GenericSignedPreKey, IdentityKeyStore, SignedPreKeyStore};
+
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let mut rng = rng_seeded(0xBA5E);
+    let msg = make_real_provision_message(&mut rng, "+15555550111");
+    persist_provision_message(&store, &msg).await.unwrap();
+
+    // Both batches start at next_id=1; before the per-identity scoping
+    // landed, this overwrote ACI's signed_prekey at id=101 with PNI's.
+    let aci_batch = generate_batch(&mut rng, &store, IdentityKind::Aci, 1).await.unwrap();
+    let pni_batch = generate_batch(&mut rng, &store, IdentityKind::Pni, 1).await.unwrap();
+    assert_eq!(aci_batch.signed_prekey_id, 101);
+    assert_eq!(pni_batch.signed_prekey_id, 101);
+
+    // Distinct PNI registration id (signal-cli pattern).
+    use rand::Rng as _;
+    let pni_registration_id: u32 = rng.random_range(1..=16380);
+    store.set_pni_registration_id(pni_registration_id).await.unwrap();
+
+    persist_batch(&store, &aci_batch, IdentityKind::Aci).await.unwrap();
+    persist_batch(&store, &pni_batch, IdentityKind::Pni).await.unwrap();
+
+    // Both signed_prekey rows at id=101 must exist and round-trip to
+    // the correct private halves through their scoped stores.
+    let aci_scoped = store.scoped(IdentityKind::Aci);
+    let pni_scoped = store.scoped(IdentityKind::Pni);
+    let signed_id_101 = libsignal_protocol::SignedPreKeyId::from(101u32);
+    let aci_loaded = SignedPreKeyStore::get_signed_pre_key(&aci_scoped, signed_id_101)
+        .await
+        .unwrap();
+    let pni_loaded = SignedPreKeyStore::get_signed_pre_key(&pni_scoped, signed_id_101)
+        .await
+        .unwrap();
+    assert_eq!(
+        aci_loaded.serialize().unwrap(),
+        aci_batch.signed_record.serialize().unwrap(),
+        "ACI signed prekey at id=101 must match the generated ACI record"
+    );
+    assert_eq!(
+        pni_loaded.serialize().unwrap(),
+        pni_batch.signed_record.serialize().unwrap(),
+        "PNI signed prekey at id=101 must match the generated PNI record"
+    );
+    // The bug we are preventing: the two records must NOT be equal.
+    assert_ne!(
+        aci_loaded.serialize().unwrap(),
+        pni_loaded.serialize().unwrap(),
+        "ACI and PNI signed prekeys at the same id must differ"
+    );
+
+    // Both registration ids must be persisted and distinct.
+    let aci_reg = aci_scoped.get_local_registration_id().await.unwrap();
+    let pni_reg = pni_scoped.get_local_registration_id().await.unwrap();
+    assert_ne!(
+        aci_reg, pni_reg,
+        "ACI and PNI registration ids must be independently generated"
+    );
+    assert_eq!(pni_reg, pni_registration_id);
+}
