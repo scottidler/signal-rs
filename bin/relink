@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Wipe local state, start `signal-rs link`, surface the QR PNG, and
+# stream link logs until the command exits.
+#
+# QR delivery is auto-detected:
+#   - SSH session (SSH_CONNECTION set): scp the PNG to the laptop so
+#     you can scan from a phone next to it. Default host is
+#     ltl-7007.lan, overridable with --host.
+#   - Local session: open the PNG with xdg-open (eog / feh / whatever
+#     the desktop is configured for) and hold the phone up to it.
+# Force one mode or the other with --scp / --open.
+#
+# Usage:
+#   bin/relink                   # wipes state, fresh link (auto-detect QR delivery)
+#   bin/relink --resume          # keeps state, only useful for half-linked retry
+#   bin/relink --scp             # force scp mode (uses $HOST)
+#   bin/relink --open            # force local viewer mode
+#   bin/relink --host other.lan  # override scp target (default ltl-7007.lan)
+#
+# Exit code mirrors the link command's exit code.
+
+set -euo pipefail
+
+STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/signal-rs"
+QR_PATH="$STATE_DIR/link-qr.png"
+LOG_PATH="$STATE_DIR/logs/signal-rs.log"
+HOST="ltl-7007.lan"
+DEST="~/Pictures/"
+RESUME=0
+NAME="signal-rs-smoke"
+MODE="auto"   # auto | scp | open
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --resume) RESUME=1; shift ;;
+    --host)   HOST="$2"; shift 2 ;;
+    --name)   NAME="$2"; shift 2 ;;
+    --scp)    MODE="scp"; shift ;;
+    --open)   MODE="open"; shift ;;
+    -h|--help)
+      sed -n '2,21p' "$0"; exit 0 ;;
+    *)
+      echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+# Auto-detect: if we're in an SSH session, default to scp; otherwise
+# open locally. SSH_CONNECTION is set by sshd and absent for local
+# logins, so it's the canonical signal here.
+if [[ "$MODE" == "auto" ]]; then
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    MODE="scp"
+  else
+    MODE="open"
+  fi
+fi
+
+if [[ "$RESUME" -eq 0 ]]; then
+  if command -v rkvr >/dev/null 2>&1; then
+    rkvr rmrf "$STATE_DIR" >/dev/null 2>&1 || true
+  else
+    echo "rkvr not on PATH; refusing to rm state dir" >&2
+    exit 1
+  fi
+fi
+
+# Start link in background, capture its pid for wait/cleanup.
+signal-rs --log-level debug link --name "$NAME" &
+LINK_PID=$!
+trap 'kill -TERM "$LINK_PID" 2>/dev/null || true' EXIT INT TERM
+
+# Wait for the PNG. The link command writes it synchronously in its
+# display_qr callback within ~1s of starting; 30s is a generous fence.
+for _ in $(seq 1 60); do
+  [[ -f "$QR_PATH" ]] && break
+  sleep 0.5
+done
+if [[ ! -f "$QR_PATH" ]]; then
+  echo "qr png never appeared at $QR_PATH; link command died?" >&2
+  exit 1
+fi
+
+case "$MODE" in
+  scp)
+    scp "$QR_PATH" "$HOST":"$DEST" >/dev/null
+    echo "PNG on $HOST:${DEST}link-qr.png  --  SCAN NOW"
+    ;;
+  open)
+    if ! command -v xdg-open >/dev/null 2>&1; then
+      echo "xdg-open not on PATH; cannot open QR locally" >&2
+      echo "QR is at: $QR_PATH" >&2
+      exit 1
+    fi
+    xdg-open "$QR_PATH" >/dev/null 2>&1 &
+    echo "PNG opened locally ($QR_PATH)  --  SCAN NOW"
+    ;;
+esac
+
+# Let the link command run to completion (it blocks waiting for the
+# envelope). Cancel the EXIT trap on success so we don't SIGTERM a
+# successful link if the shell exits in a race.
+if wait "$LINK_PID"; then
+  trap - EXIT
+  echo "link succeeded"
+  exit 0
+else
+  rc=$?
+  trap - EXIT
+  echo "link failed (exit $rc); tail of log:"
+  /usr/bin/tail -10 "$LOG_PATH" >&2 || true
+  exit "$rc"
+fi
