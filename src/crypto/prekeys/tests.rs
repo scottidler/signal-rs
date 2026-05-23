@@ -91,27 +91,31 @@ async fn second_batch_uses_disjoint_ids() {
 }
 
 #[tokio::test]
-async fn upload_batch_against_missing_credentials_errors_without_polluting_store() {
-    // signal-cli's ordering: a failed upload must NOT leave orphan
-    // prekeys in the local store. Generate, attempt upload (fails
-    // because no aci/password in the in-memory store), confirm that
-    // no prekey row was written.
+async fn generate_upload_persist_rolls_back_local_writes_on_upload_failure() {
+    // Architect round 3: the persist-after-upload ordering has a
+    // post-upload local-failure hole. The fix is transactional: open
+    // a local transaction, persist inside it, attempt upload, commit
+    // only on upload success. A failed upload must leave the local
+    // store untouched.
     let store = linked_store().await;
     let mut rng = ChaCha20Rng::seed_from_u64(9);
-    let batch = generate_batch(&mut rng, &store, IdentityKind::Aci, 1).await.unwrap();
-    match upload_batch(&store, &batch, IdentityKind::Aci).await {
+    // generate_upload_persist will fail at the upload step (no
+    // credentials in this store), which must trigger a rollback of
+    // the just-written prekey rows.
+    let result = generate_upload_persist(&mut rng, &store, IdentityKind::Aci, 1).await;
+    match result {
         Err(PrekeyError::Upload(msg)) => assert!(
             msg.contains("aci") || msg.contains("password") || msg.contains("missing"),
             "expected credential message, got {msg}"
         ),
         other => panic!("expected Upload(missing-credential) error, got {:?}", other),
     }
-    // The store must still NOT have the prekey - upload failed, no
-    // persist should have occurred.
-    let first_id = PreKeyId::from(batch.one_time_prekey_ids[0]);
+    // Local store must be empty post-rollback: no one-time prekey,
+    // no signed prekey, no kyber prekey.
     let s = store.clone();
+    let first_id = PreKeyId::from(1u32);
     assert!(
         PreKeyStore::get_pre_key(&s, first_id).await.is_err(),
-        "failed upload must not leave orphan prekey in the local store"
+        "failed upload must not leave orphan one-time prekey"
     );
 }

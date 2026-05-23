@@ -189,26 +189,32 @@ pub async fn complete_device_registration(
     Ok(device_id)
 }
 
-/// Upload a generated prekey batch under the given identity (ACI or
-/// PNI). Issues `PUT /v2/keys/?identity={kind}` with HTTP Basic auth.
-/// The auth user is `{service_id}.{device_id}` where `service_id` is
-/// the ACI/PNI UUID for the identity being uploaded; the auth password
-/// is the same regardless of identity (one device password per device).
-/// The body's `identityKey` field is the public half of the keypair
-/// that signed this batch's signed-prekey and kyber-prekey.
-pub async fn upload_keys_for_identity(
+/// Pre-fetched credentials needed for the keys-upload PUT. Bundled by
+/// [`load_upload_credentials`] BEFORE the caller opens any transaction
+/// so the HTTP upload path never reaches back into the connection pool
+/// (which the transaction holds for its lifetime).
+pub struct UploadCredentials {
+    pub identity_keypair: libsignal_protocol::IdentityKeyPair,
+    pub service_id: String,
+    pub device_id: u32,
+    pub password: String,
+}
+
+/// Read everything `upload_keys_for_identity` needs from the store
+/// once, before any transaction is opened. Decouples the upload path
+/// from the connection pool so the transactional persist+upload flow
+/// cannot deadlock against itself.
+pub async fn load_upload_credentials(
     store: &SqliteStore,
-    batch: &GeneratedBatch,
     identity_kind: IdentityKind,
-) -> Result<(), ApiError> {
+) -> Result<UploadCredentials, ApiError> {
     let identity = store.load_identity().await?;
     let password = store
         .get_password()
         .await?
         .ok_or(ApiError::MissingCredential("password"))?;
 
-    // Pick the right identity keypair + service-id for the URL/auth.
-    let (signing_keypair, auth_service_id) = match identity_kind {
+    let (identity_keypair, service_id) = match identity_kind {
         IdentityKind::Aci => {
             let aci = store.get_aci().await?.ok_or(ApiError::MissingCredential("aci"))?;
             (identity.identity_keypair, aci)
@@ -223,11 +229,28 @@ pub async fn upload_keys_for_identity(
         }
     };
 
-    let body = build_prekey_upload_body(store, &signing_keypair, batch).await?;
+    Ok(UploadCredentials {
+        identity_keypair,
+        service_id,
+        device_id: identity.device_id,
+        password,
+    })
+}
+
+/// Upload a generated prekey batch under the given identity (ACI or
+/// PNI). Issues `PUT /v2/keys/?identity={kind}` with HTTP Basic auth.
+/// **No store access** — takes pre-fetched [`UploadCredentials`] so
+/// callers may safely hold a `sqlx::Transaction` while this runs.
+pub async fn upload_keys_for_identity(
+    creds: &UploadCredentials,
+    batch: &GeneratedBatch,
+    identity_kind: IdentityKind,
+) -> Result<(), ApiError> {
+    let body = build_prekey_upload_body(&creds.identity_keypair, batch)?;
 
     let url = format!("{CHAT_BASE_URL}/v2/keys/?identity={}", identity_kind.as_query_param());
-    let user = format!("{auth_service_id}.{}", identity.device_id);
-    let auth_header = basic_auth_header(&user, &password);
+    let user = format!("{}.{}", creds.service_id, creds.device_id);
+    let auth_header = basic_auth_header(&user, &creds.password);
 
     debug!(
         "upload_keys_for_identity: identity={:?} url={} user={}",
@@ -256,51 +279,41 @@ pub async fn upload_keys_for_identity(
     Ok(())
 }
 
-/// Build the JSON body for a keys upload from a `GeneratedBatch` plus the
-/// identity keypair the batch was signed with. The store is consulted to
-/// recover the persisted public keys + signatures by id (the batch carries
-/// only ids).
-async fn build_prekey_upload_body(
-    store: &SqliteStore,
+/// Build the JSON body for a keys upload directly from the in-memory
+/// `GeneratedBatch`. Reads ZERO from the store - load-bearing for the
+/// transactional persist+upload flow, where the prekey rows are still
+/// inside an in-flight `sqlx::Transaction` and not visible to a
+/// separate pool checkout.
+fn build_prekey_upload_body(
     identity_keypair: &libsignal_protocol::IdentityKeyPair,
     batch: &GeneratedBatch,
 ) -> Result<PreKeyUploadBody, ApiError> {
-    use libsignal_protocol::{
-        KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore, PreKeyId, PreKeyRecord, PreKeyStore, SignedPreKeyId,
-        SignedPreKeyRecord, SignedPreKeyStore,
-    };
-
     let identity_key_b64 = b64(identity_keypair.public_key().serialize().as_ref());
 
-    // One-time prekeys
-    let mut pre_keys = Vec::with_capacity(batch.one_time_prekey_ids.len());
-    let store_mut = store.clone();
-    for id in &batch.one_time_prekey_ids {
-        let record: PreKeyRecord = PreKeyStore::get_pre_key(&store_mut, PreKeyId::from(*id)).await?;
+    // One-time prekeys: pull the public half straight from each
+    // PreKeyRecord in the batch.
+    let mut pre_keys = Vec::with_capacity(batch.one_time_records.len());
+    for (idx, record) in batch.one_time_records.iter().enumerate() {
         pre_keys.push(PreKeyJson {
-            key_id: *id,
+            key_id: batch.one_time_prekey_ids[idx],
             public_key: b64(record.key_pair()?.public_key.serialize().as_ref()),
         });
     }
 
     // Signed prekey
-    let signed: SignedPreKeyRecord =
-        SignedPreKeyStore::get_signed_pre_key(&store_mut, SignedPreKeyId::from(batch.signed_prekey_id)).await?;
-    let signed_kp = signed.key_pair()?;
+    let signed_kp = batch.signed_record.key_pair()?;
     let signed_pre_key = SignedPreKeyJson {
         key_id: batch.signed_prekey_id,
         public_key: b64(signed_kp.public_key.serialize().as_ref()),
-        signature: b64(signed.signature()?.as_ref()),
+        signature: b64(batch.signed_record.signature()?.as_ref()),
     };
 
-    // Kyber last-resort prekey (one per batch in v0.1)
-    let kyber: KyberPreKeyRecord =
-        KyberPreKeyStore::get_kyber_pre_key(&store_mut, KyberPreKeyId::from(batch.kyber_prekey_id)).await?;
-    let kyber_kp = kyber.key_pair()?;
+    // Kyber last-resort prekey
+    let kyber_kp = batch.kyber_record.key_pair()?;
     let pq_last_resort = KyberPreKeyJson {
         key_id: batch.kyber_prekey_id,
         public_key: b64(&kyber_kp.public_key.serialize()),
-        signature: b64(kyber.signature()?.as_ref()),
+        signature: b64(batch.kyber_record.signature()?.as_ref()),
     };
 
     Ok(PreKeyUploadBody {
@@ -399,13 +412,11 @@ mod tests {
             .save_identity_bundle(&identity, 12345, "+15555550100", 1, crate::storage::LinkStatus::Linked)
             .await
             .unwrap();
-        // generate_batch produces records in memory but the test path
-        // reads them back from the store via the upload-body builder.
-        // Persist directly for the test (skipping the upload that we
-        // can't run without a live server).
+        // generate_batch produces records in memory; build_prekey_upload_body
+        // now reads them directly from the batch without touching the
+        // store, so no persist is needed for the test.
         let batch = generate_batch(&mut rng, &store, IdentityKind::Aci, 1).await.unwrap();
-        crate::crypto::prekeys::persist_batch(&store, &batch).await.unwrap();
-        let body = build_prekey_upload_body(&store, &identity, &batch).await.unwrap();
+        let body = build_prekey_upload_body(&identity, &batch).unwrap();
 
         let json: serde_json::Value = serde_json::to_value(&body).unwrap();
         let obj = json.as_object().expect("body is a JSON object");

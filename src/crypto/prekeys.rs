@@ -1,10 +1,30 @@
 //! Prekey lifecycle helpers — generate batches, upload them to Signal's
-//! keyserver, then persist locally.
+//! keyserver, persist locally.
 //!
-//! The order matters: signal-cli's `PreKeyHelper.refreshPreKeys` uploads
-//! first and only writes to the local store on success. This module
-//! mirrors that ordering so a failed upload cannot leave orphan prekeys
-//! in the local DB that the server doesn't know about.
+//! ## Ordering — local-transactional persist+upload
+//!
+//! signal-cli's `PreKeyHelper.refreshPreKeys` uploads first and writes
+//! locally on success. That order eliminates the "local row exists but
+//! server doesn't" hole at the cost of opening a different one: if the
+//! local write fails *after* a successful upload, the server hands out
+//! prekeys we can't fulfill (peers initiate PreKey sessions against
+//! IDs we don't have private halves for, decrypt fails, messages drop).
+//!
+//! We close both holes with a local transaction:
+//!
+//! 1. `generate_batch` produces records in memory (no I/O beyond
+//!    reading the identity keypair once).
+//! 2. Pre-fetch upload credentials so the upload path never re-enters
+//!    the connection pool while the transaction holds it.
+//! 3. `pool.begin()` opens a transaction; `persist_batch_in_tx` writes
+//!    the records inside it.
+//! 4. `upload_keys_for_identity` issues the keys PUT.
+//! 5. On upload success: `tx.commit()`. On any earlier failure: drop
+//!    `TxStore`, sqlx rolls the transaction back, local store unchanged.
+//!
+//! Only the `tx.commit()` step itself can produce a server-vs-local
+//! mismatch (disk full, fsync error after a successful upload); that's
+//! a strictly narrower window than either of the simpler orderings.
 
 use libsignal_protocol::{
     GenericSignedPreKey, KeyPair, KyberPreKeyRecord, PreKeyId, PreKeyRecord, PreKeyStore, SignalProtocolError,
@@ -148,9 +168,10 @@ pub async fn generate_batch<R: rand::Rng + rand::CryptoRng>(
     })
 }
 
-/// Persist a generated batch to the local SQLite store. Call ONLY after
-/// [`upload_batch`] succeeds — signal-cli's order — so a failed upload
-/// cannot leave orphan prekeys in the local DB.
+/// Persist a generated batch to the local SQLite store via the
+/// pool-backed `SqliteStore`. Each save is its own atomic SQL op; the
+/// batch as a whole is not transactional. Prefer
+/// [`persist_batch_in_tx`] for the upload-or-rollback path.
 pub async fn persist_batch(store: &SqliteStore, batch: &GeneratedBatch) -> Result<(), PrekeyError> {
     debug!(
         "persist_batch: writing {} one-time + 1 signed + 1 kyber prekey to local store",
@@ -182,35 +203,132 @@ pub async fn persist_batch(store: &SqliteStore, batch: &GeneratedBatch) -> Resul
     Ok(())
 }
 
+/// Persist a generated batch inside the given [`TxStore`]'s in-flight
+/// transaction. Used by [`generate_upload_persist`] so that an upload
+/// failure or a commit failure rolls back the prekey writes
+/// atomically, preventing the "server has prekeys but local DB
+/// doesn't" failure mode the Architect flagged.
+async fn persist_batch_in_tx(
+    tx_store: &crate::storage::tx::TxStore,
+    batch: &GeneratedBatch,
+) -> Result<(), PrekeyError> {
+    debug!(
+        "persist_batch_in_tx: writing {} one-time + 1 signed + 1 kyber prekey inside transaction",
+        batch.one_time_records.len()
+    );
+
+    let mut pre_key = tx_store.pre_key_store();
+    let mut signed = tx_store.signed_pre_key_store();
+    let mut kyber = tx_store.kyber_pre_key_store();
+
+    for (idx, record) in batch.one_time_records.iter().enumerate() {
+        let id = PreKeyId::from(batch.one_time_prekey_ids[idx]);
+        PreKeyStore::save_pre_key(&mut pre_key, id, record).await?;
+    }
+    SignedPreKeyStore::save_signed_pre_key(
+        &mut signed,
+        SignedPreKeyId::from(batch.signed_prekey_id),
+        &batch.signed_record,
+    )
+    .await?;
+    libsignal_protocol::KyberPreKeyStore::save_kyber_pre_key(
+        &mut kyber,
+        libsignal_protocol::KyberPreKeyId::from(batch.kyber_prekey_id),
+        &batch.kyber_record,
+    )
+    .await?;
+    Ok(())
+}
+
 /// Upload a generated batch to Signal's keyserver under the given
-/// identity. Reads credentials (aci, password, device_id, identity
-/// keypair) from the store but reads the prekey records from `batch`.
+/// identity. Convenience wrapper that loads credentials from the store
+/// and then dispatches. Callers that need to interleave upload with an
+/// open transaction should call [`crate::api::load_upload_credentials`]
+/// up-front and then [`crate::api::upload_keys_for_identity`] directly.
 pub async fn upload_batch(
     store: &SqliteStore,
     batch: &GeneratedBatch,
     identity_kind: IdentityKind,
 ) -> Result<(), PrekeyError> {
     log::debug!("upload_batch: identity={identity_kind:?}");
-    crate::api::upload_keys_for_identity(store, batch, identity_kind)
+    let creds = crate::api::load_upload_credentials(store, identity_kind)
         .await
-        .map_err(|e| match e {
-            crate::api::ApiError::Storage(s) => PrekeyError::Store(s),
-            other => PrekeyError::Upload(other.to_string()),
-        })
+        .map_err(api_to_prekey)?;
+    crate::api::upload_keys_for_identity(&creds, batch, identity_kind)
+        .await
+        .map_err(api_to_prekey)
 }
 
-/// Convenience orchestrator matching signal-cli's ordering: generate
-/// records in memory, upload to the server, then — only on upload
-/// success — persist to the local store.
+fn api_to_prekey(e: crate::api::ApiError) -> PrekeyError {
+    match e {
+        crate::api::ApiError::Storage(s) => PrekeyError::Store(s),
+        other => PrekeyError::Upload(other.to_string()),
+    }
+}
+
+/// Orchestrator for a full prekey refresh: generate records in memory,
+/// persist them inside a local sqlx transaction, upload to the server,
+/// and commit only if the upload succeeds.
+///
+/// **Rationale** (Architect round 3): signal-cli's order is
+/// "upload-then-persist," which assumes local writes never fail. If a
+/// local write fails *after* the upload succeeded, Signal's server
+/// hands out prekeys we can't fulfill, peers establish PreKey sessions
+/// against IDs we don't have the private halves for, and inbound
+/// messages fail to decrypt — a permanent message-loss hole. The
+/// transactional persist+upload flow eliminates that hole:
+///
+/// - persist fails before upload  -> rollback, no upload attempted
+/// - upload fails after persist   -> rollback, no orphan rows
+/// - upload + commit both succeed -> server and local state agree
+///
+/// The only remaining failure mode is `tx.commit()` itself failing
+/// after a successful upload (sqlite commit is a single write-ahead
+/// barrier flush; failures are rare and indicate disk/filesystem
+/// trouble). We surface that as an error rather than silently
+/// proceeding.
 pub async fn generate_upload_persist<R: rand::Rng + rand::CryptoRng>(
     rng: &mut R,
     store: &SqliteStore,
     identity_kind: IdentityKind,
     next_id: u32,
 ) -> Result<GeneratedBatch, PrekeyError> {
+    // 1. Generate the records in memory.
     let batch = generate_batch(rng, store, identity_kind, next_id).await?;
-    upload_batch(store, &batch, identity_kind).await?;
-    persist_batch(store, &batch).await?;
+
+    // 2. Read upload credentials BEFORE opening the transaction. The
+    //    upload path must not touch the connection pool while the
+    //    transaction holds a connection (in `:memory:` test stores
+    //    with pool_size=1 this would deadlock; in production it
+    //    would just stall and time out).
+    let creds = crate::api::load_upload_credentials(store, identity_kind)
+        .await
+        .map_err(api_to_prekey)?;
+
+    // 3. Open a local transaction and write the records inside it.
+    let pool = store.pool().clone();
+    let tx = pool.begin().await.map_err(crate::storage::StoreError::from)?;
+    let tx_store = crate::storage::tx::TxStore::new(tx);
+    persist_batch_in_tx(&tx_store, &batch).await?;
+
+    // 4. Attempt the upload using the pre-fetched credentials. No
+    //    store access here — safe even though the tx still holds a
+    //    connection. On failure, `tx_store` drops at the end of this
+    //    scope and sqlx rolls back the transaction.
+    crate::api::upload_keys_for_identity(&creds, &batch, identity_kind)
+        .await
+        .map_err(api_to_prekey)?;
+
+    // 5. Upload succeeded. Commit the transaction. The only remaining
+    //    failure mode is `tx.commit()` itself failing (disk full,
+    //    fsync error) — at that point the server believes we have
+    //    prekeys we don't. Surface the error so the caller can decide
+    //    how to handle the inconsistency.
+    tx_store
+        .commit()
+        .await
+        .map_err(|e| PrekeyError::Storage(crate::storage::StoreError::Sqlx(e)))?;
+
     Ok(batch)
 }
 
