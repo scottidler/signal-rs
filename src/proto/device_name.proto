@@ -1,0 +1,17 @@
+// Vendored from signalapp/Signal-Android:
+//   app/src/main/protowire/DeviceName.proto
+//
+// The encrypted linked-device name wire format that travels in the
+// `name` field of `LinkDeviceRequest::accountAttributes` (and the
+// equivalent SetDeviceNameRequest). Signal-Server accepts the encoded
+// protobuf bytes base64-encoded as a JSON string.
+
+syntax = "proto2";
+
+package signalrs.device_name;
+
+message DeviceName {
+  optional bytes ephemeralPublic = 1;
+  optional bytes syntheticIv     = 2;
+  optional bytes ciphertext      = 3;
+}

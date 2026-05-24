@@ -6,10 +6,12 @@
 //! that arrive over the provisioning WebSocket. Reference:
 //! signal-service-android's ProvisioningCipher.java.
 
+pub mod device_name;
 pub mod prekeys;
 pub mod provisioning;
 pub mod sealed;
 
+pub use device_name::{DeviceNameError, decrypt_device_name, encrypt_device_name};
 pub use prekeys::{
     GeneratedBatch, IdentityKind, PrekeyError, generate_batch, generate_upload_persist, persist_batch, upload_batch,
 };

@@ -27,8 +27,13 @@ fn main() {
     // separate (different message scope).
     println!("cargo:rerun-if-changed=src/proto/provisioning.proto");
     println!("cargo:rerun-if-changed=src/proto/service.proto");
+    println!("cargo:rerun-if-changed=src/proto/device_name.proto");
     prost_build::compile_protos(
-        &["src/proto/provisioning.proto", "src/proto/service.proto"],
+        &[
+            "src/proto/provisioning.proto",
+            "src/proto/service.proto",
+            "src/proto/device_name.proto",
+        ],
         &["src/proto/"],
     )
     .expect("failed to compile vendored protos");

@@ -27,6 +27,7 @@ use log::{debug, info};
 use thiserror::Error;
 use tokio::time::timeout;
 
+use crate::crypto::device_name::{DeviceNameError, encrypt_device_name};
 use crate::crypto::prekeys::{IdentityKind, PrekeyError};
 use crate::crypto::provisioning::{ProvisioningKeyPair, decrypt_envelope, proto::ProvisionMessage};
 use crate::net::{Environment as NetEnv, NetError, connect_provisioning};
@@ -88,6 +89,9 @@ pub enum LinkError {
 
     #[error("device-completion failed (PUT /v1/devices): {0}")]
     DeviceCompletion(String),
+
+    #[error("device-name encryption failed: {0}")]
+    DeviceName(#[from] DeviceNameError),
 }
 
 /// Outcome returned to the caller of [`link`] once linking succeeds and
@@ -345,6 +349,14 @@ async fn finalize_after_persist(
             };
             store.set_pni_registration_id(pni_registration_id).await?;
 
+            // Encrypted device name. The phone's Linked Devices UI
+            // decrypts and displays this; the server stores the
+            // ciphertext opaquely. Signal-Server's max accepted size
+            // is 225 base64-decoded bytes, comfortably above the
+            // ~55-byte protobuf overhead + typical device labels;
+            // server returns 422 on overflow, no client-side cap.
+            let encrypted_name = encrypt_device_name(device_name, &identity.identity_keypair)?;
+
             // Per-identity prekey storage: ACI and PNI rows live in
             // disjoint `(identity_kind, id)` partitions in the local
             // SQLite tables, so both batches start at id=1.
@@ -367,7 +379,7 @@ async fn finalize_after_persist(
             let assigned = crate::api::link_device(
                 store,
                 &code,
-                device_name,
+                Some(&encrypted_name),
                 account_number,
                 aci_registration_id,
                 pni_registration_id,

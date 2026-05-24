@@ -76,10 +76,13 @@ struct LinkDeviceRequestBody<'a> {
 /// `capabilities` MUST be non-null (the controller rejects null with 422)
 /// and MUST deserialize as a `Map<String, Boolean>` per
 /// `DeviceCapabilityAdapter.Deserializer`; we send an empty object `{}`.
-/// `name` is intentionally omitted: the field is `byte[]` server-side
-/// (encrypted device name); we leave it empty for v0.1 since the
-/// linked-devices UI label is cosmetic and Signal's validator accepts a
-/// missing/null name field.
+/// `name` is the encrypted device name: protobuf-encoded
+/// `DeviceName { ephemeralPublic, syntheticIv, ciphertext }` then
+/// base64-encoded. Server-side it deserializes via
+/// `DeviceNameByteArrayAdapter.Deserializer` into a `byte[]` with a max
+/// size of 225 bytes after base64-decode. Plaintext leakage was the
+/// concern: the phone displays the name, the server only sees opaque
+/// ciphertext.
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct LinkAccountAttributes {
@@ -87,6 +90,8 @@ struct LinkAccountAttributes {
     registration_id: u32,
     pni_registration_id: u32,
     capabilities: std::collections::HashMap<String, bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 /// JSON response shape from `PUT /v1/devices/link`. Matches
@@ -173,7 +178,7 @@ pub struct LinkPreKeys<'a> {
 pub async fn link_device(
     store: &SqliteStore,
     provisioning_code: &str,
-    device_name: &str,
+    encrypted_device_name: Option<&str>,
     number: &str,
     aci_registration_id: u32,
     pni_registration_id: u32,
@@ -181,11 +186,11 @@ pub async fn link_device(
     pni_prekeys: LinkPreKeys<'_>,
 ) -> Result<u32, ApiError> {
     debug!(
-        "link_device: number={} aci_reg_id={} pni_reg_id={} device_name={} aci_signed_id={} aci_kyber_id={} pni_signed_id={} pni_kyber_id={}",
+        "link_device: number={} aci_reg_id={} pni_reg_id={} encrypted_name_b64_len={} aci_signed_id={} aci_kyber_id={} pni_signed_id={} pni_kyber_id={}",
         number,
         aci_registration_id,
         pni_registration_id,
-        device_name,
+        encrypted_device_name.map(str::len).unwrap_or(0),
         aci_prekeys.signed_id,
         aci_prekeys.kyber_id,
         pni_prekeys.signed_id,
@@ -206,6 +211,7 @@ pub async fn link_device(
             // the check; libsignal-protocol's session machinery handles
             // SPQR transparently when peers initiate sessions that use it.
             capabilities: [("spqr".to_string(), true)].into_iter().collect(),
+            name: encrypted_device_name.map(str::to_string),
         },
         aci_signed_pre_key: signed_prekey_json(&aci_prekeys)?,
         pni_signed_pre_key: signed_prekey_json(&pni_prekeys)?,
@@ -530,9 +536,12 @@ pub async fn fetch_sender_certificate(creds: &UploadCredentials) -> Result<(Vec<
     Ok((bytes, expiry_ms))
 }
 
-/// One entry of the `GET /v1/devices` response. `name` is the
-/// server-stored encrypted device name (base64); decryption is Phase 9
-/// territory and intentionally not done here. `created_ms` and
+/// One entry of the `GET /v1/devices` response. `name` is whatever the
+/// server stored: typically a base64-encoded `DeviceName` protobuf,
+/// occasionally a plaintext string from older third-party clients.
+/// [`crate::crypto::device_name::decrypt_device_name`] handles the
+/// base64 form; callers wanting human-readable names should decrypt
+/// (see [`crate::client::Client::status`]). `created_ms` and
 /// `last_seen_ms` are millisecond epoch timestamps the server reports.
 #[derive(Debug, Clone, Serialize)]
 pub struct DeviceEntry {
