@@ -555,6 +555,28 @@ pub(crate) fn route_envelope_to_identity(
     }
 }
 
+/// Strip Signal's plaintext padding before protobuf decode. Signal pads
+/// decrypted message plaintext by appending a single `0x80` byte followed
+/// by zero or more `0x00` bytes up to a length boundary. The protobuf
+/// decoder must see only the payload preceding the `0x80`; without this
+/// strip, the trailing `0x80 0x00 ...` parses as a varint of value 0
+/// which is an invalid protobuf tag.
+///
+/// Strategy: walk from the end of the buffer, skip trailing `0x00` bytes,
+/// then expect a single `0x80` marker and return the slice up to (but
+/// excluding) that marker. If no marker is found the input was not padded
+/// and is returned unchanged.
+pub(crate) fn strip_signal_padding(plaintext: &[u8]) -> &[u8] {
+    for i in (0..plaintext.len()).rev() {
+        match plaintext[i] {
+            0x00 => continue,
+            0x80 => return &plaintext[..i],
+            _ => return plaintext,
+        }
+    }
+    plaintext
+}
+
 /// Translate decrypted Signal Content protobuf bytes into our public
 /// [`Envelope`] enum. Decodes via prost-generated `signalservice::Content`.
 ///
@@ -592,7 +614,9 @@ fn decode_content(
         timestamp
     );
 
-    let content = match proto::Content::decode(plaintext) {
+    let unpadded = strip_signal_padding(plaintext);
+
+    let content = match proto::Content::decode(unpadded) {
         Ok(c) => c,
         Err(e) => {
             warn!("decode_content: prost Content decode failed: {e}");

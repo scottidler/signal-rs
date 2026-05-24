@@ -229,7 +229,7 @@ fn route_aci_destination_works_without_local_pni() {
 
 use crate::client::{
     build_delete_content, build_one_to_one_content, build_sync_delete_content, build_sync_self_content,
-    build_typing_content, decode_content,
+    build_typing_content, decode_content, strip_signal_padding,
 };
 use crate::crypto::provisioning::proto;
 use crate::envelope::{Envelope as PubEnvelope, ReceiptKind, Recipient, SyncMessage as PubSyncMessage};
@@ -759,4 +759,64 @@ async fn delete_for_everyone_to_aci_without_session_or_profile_key_errors_with_n
         Err(SendError::NoProfileKey(_)) => {}
         other => panic!("expected NoProfileKey, got {:?}", other),
     }
+}
+
+// =============================================================================
+// strip_signal_padding: Phase 1 defect found by Phase 10 smoke
+// =============================================================================
+//
+// libsignal returns the raw padded plaintext from a Whisper / sealed-sender
+// decrypt. Signal pads with a single 0x80 marker followed by zero or more
+// 0x00 bytes. Before the strip was added, decode_content fed the padded
+// buffer straight into prost Content::decode and got "invalid tag value: 0"
+// on the trailing 0x80 0x00 sequence. These tests pin the strip behaviour
+// and the end-to-end padded-plaintext round-trip through decode_content.
+
+#[test]
+fn strip_signal_padding_removes_0x80_and_trailing_zeros() {
+    let payload = b"\x0a\x05hello";
+    let mut padded = payload.to_vec();
+    padded.push(0x80);
+    padded.extend_from_slice(&[0u8; 17]);
+    assert_eq!(strip_signal_padding(&padded), payload);
+}
+
+#[test]
+fn strip_signal_padding_handles_zero_trailing_zeros() {
+    let payload = b"\x0a\x05hello";
+    let mut padded = payload.to_vec();
+    padded.push(0x80);
+    assert_eq!(strip_signal_padding(&padded), payload);
+}
+
+#[test]
+fn strip_signal_padding_unpadded_input_returns_unchanged() {
+    // A buffer whose last non-zero byte is neither 0x00 nor 0x80 was not
+    // padded; the strip routine must leave it untouched.
+    let payload = b"\x0a\x05hello";
+    assert_eq!(strip_signal_padding(payload), payload);
+}
+
+#[test]
+fn strip_signal_padding_empty_input_is_empty() {
+    let empty: &[u8] = &[];
+    assert_eq!(strip_signal_padding(empty), empty);
+}
+
+#[test]
+fn decode_content_strips_padding_before_protobuf_decode() {
+    let body = "padded plaintext from a peer";
+    let ts = 1_700_000_000_999_u64;
+    let plaintext = build_one_to_one_content(body, ts, &[]);
+
+    let mut padded = plaintext.clone();
+    padded.push(0x80);
+    padded.extend_from_slice(&[0u8; 23]);
+
+    let (env_opt, _) = decode_content(&padded, ACI, 1, ts);
+    let env = env_opt.expect("Content decodes after padding strip");
+    let PubEnvelope::DataMessage { body: env_body, .. } = env else {
+        panic!("expected Envelope::DataMessage, got something else");
+    };
+    assert_eq!(env_body.as_deref(), Some(body));
 }
