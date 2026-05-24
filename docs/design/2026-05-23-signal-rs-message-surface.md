@@ -3,7 +3,7 @@
 **Author:** Scott Idler
 **Date:** 2026-05-23
 **Status:** Draft
-**Review Passes Completed:** 5/5 + Architect Rounds 1-2
+**Review Passes Completed:** 5/5 + Architect Rounds 1-3
 
 ## Summary
 
@@ -935,6 +935,7 @@ worse than it found it.
 | Attachment CDN URL format / CDN authentication changes | Low | Med | Phase 4 mirrors signal-cli's `AttachmentHelper.retrieveAttachment` exactly; cross-check `cdn0`, `cdn2`, `cdn3` paths against `cdn_number`. |
 | Multi-device peer fan-out: a peer with multiple linked devices needs one ciphertext per device, plus a `MismatchedDevices` retry path when our cached device list goes stale | Med | Med | Phase 5 generalises today's send_to_aci multi-device pattern. Explicit handling for HTTP 409 `MismatchedDevices` to refetch and retry once. signal-cli's `MessageSender` is the reference. |
 | Phase 5 sealed-sender encrypt path falls back to unsealed when we lack a profile key | Med | Med | Best-effort policy mirroring signal-cli's `UnidentifiedAccessHelper.getAccessFor` (returns @Nullable; null falls through to unsealed): try sealed sender first; if no profile key on file, fall back to unsealed `message_encrypt` and emit `warn!("sealed-sender unavailable for {recipient}, falling back to unsealed; sender identity leaks to server")`. v1 has no profile-key source besides inline `DataMessage.profile_key` (contacts backfill from `SyncMessage::Contacts` is explicitly deferred per Non-Goals), so a strict refuse policy would gate Goal 5 on a deferred feature. Strict-only mode (refuse-on-missing-profile-key) lands in Future Work once profile-key sync is implemented. Architect Round 2 consensus. |
+| Phase 7 remote-delete inherits the same unsealed fallback as Phase 5 send, but the leak signal is *richer* (the server learns "user X is retracting message Y from thread Z" on top of having already seen the original message arrive sealed) | Low | Low | Investigated in Architect Round 3 (post-Phase-7-implementation audit). Hypothesis: gate `delete_for_everyone` on profile-key availability while leaving `send` permissive, so a regretful unsealed text cannot then be retracted via an even-more-revealing unsealed delete. Refuted by tracing `AsamK/signal-cli`: `ManagerImpl.sendRemoteDeleteMessage` (`lib/.../ManagerImpl.java:955`) hands the delete-bearing `DataMessage` to the same private `sendMessage` (line 680) that handles text sends, which calls `SendHelper.sendMessage` (line 85) → `handleSendMessage` (line 768) → `UnidentifiedAccessHelper.getAccessFor` (line 77, returns `@Nullable`) → `messageSender.sendDataMessage(address, unidentifiedAccess, ...)`. The null case yields an unsealed send with no per-surface gate. Combined with the UX trap (an asymmetric strict mode makes regretful unsealed messages un-retractable), the right answer is to match signal-cli's symmetric behavior: accept the fallback for delete now, expand the Future Work "Strict sealed-sender mode" entry to cover the entire peer outbound surface (send + delete + typing) so the eventual strict toggle gates them together. Architect Round 3 consensus; resolved in commit `f8ad547`. |
 | Encrypted device name implementation diverges from signal-cli and the phone shows garbage | Low | Low | Phase 9 starts by writing a test against signal-cli's encrypt + an independent decrypt to confirm round-trip; ship only after that passes. |
 | Receive output JSON schema needs to change mid-development | Med | Low | `#[non_exhaustive]` on every variant + serde with explicit `#[serde(tag = "kind")]` means adding fields/variants is non-breaking. Document the schema in `docs/cli-json-schema.md` as it stabilises. |
 
@@ -950,6 +951,26 @@ work, with the trigger that unblocks each one.
   signal-rs has reliable profile-key coverage for the address book.
   Becomes the default once coverage is broad enough that refusing is
   a sane default rather than a footgun. Architect Round 2 consensus.
+
+  **Scope (Architect Round 3 consensus):** the strict mode must
+  encompass the *entire* peer outbound surface, not just
+  `Client::send`. That includes today's `Client::send` /
+  `Client::send_with_attachments`, `Client::delete_for_everyone`'s
+  peer-side dispatch (the own-device sync half is its own auth
+  path and not affected), and any future peer outbound surface that
+  routes through `dispatch_to_peer_aci`. A delete-or-typing
+  message that falls back to unsealed leaks sender identity in
+  the same way a regular text send does; gating one without the
+  others would create the UX trap where a user sends an unsealed
+  regret-message but cannot retract it because the retract path
+  is stricter than the send path. Reference behavior:
+  `AsamK/signal-cli`'s `ManagerImpl.sendRemoteDeleteMessage`
+  funnels through the same `SendHelper.sendMessage` →
+  `handleSendMessage` → `UnidentifiedAccessHelper.getAccessFor`
+  chain as a normal text send and silently accepts the
+  `@Nullable` access (i.e. unsealed) when no profile key is on
+  file - no per-surface privacy gate exists. signal-rs matches
+  that behavior in Phase 7 by design.
 
 - **`SyncMessage::Contacts` consumption** — decode the contacts-list
   backfill payload that the primary device pushes on link. Today
