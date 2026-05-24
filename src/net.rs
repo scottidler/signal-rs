@@ -188,3 +188,45 @@ pub async fn connect_chat_unauthenticated(
     });
     connect_endpoint(env_kind, CHAT_WEBSOCKET_PATH, Some(headers), "unauth-chat").await
 }
+
+/// Signal's self-signed root CA, DER-encoded. The Signal service stack
+/// (chat.signal.org, cdn.signal.org, cdn2.signal.org, cdn3.signal.org)
+/// chains certificates to this root instead of any public CA. System
+/// trust stores do not include it, so any `reqwest` client that talks
+/// to those hosts must opt in here. Sourced from libsignal
+/// `rust/net/res/signal.cer`.
+const SIGNAL_ROOT_CERT_DER: &[u8] = include_bytes!("../res/signal.cer");
+
+/// Build a `reqwest::Client` that trusts only Signal's self-signed root.
+/// Used for every HTTP call against `*.signal.org` outside the libsignal
+/// websocket path (today: attachment CDN download + upload, link/keys
+/// REST surface). The embedded cert parse is a compile-time invariant;
+/// runtime failure here would mean the build was corrupt, so we surface
+/// that as `reqwest::Error` via the builder.
+pub fn pinned_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    debug!("pinned_http_client: building reqwest client with Signal-pinned root CA");
+    let cert =
+        reqwest::Certificate::from_der(SIGNAL_ROOT_CERT_DER).expect("res/signal.cer is a static asset and must parse");
+    reqwest::Client::builder()
+        .user_agent(concat!("signal-rs/", env!("CARGO_PKG_VERSION")))
+        .use_rustls_tls()
+        .tls_certs_only([cert])
+        .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signal_root_cert_der_parses() {
+        // The embedded cert is a static asset; if this regresses, the
+        // pinned_http_client `.expect(...)` will trip at runtime instead.
+        reqwest::Certificate::from_der(SIGNAL_ROOT_CERT_DER).expect("Signal CA cert must parse");
+    }
+
+    #[test]
+    fn pinned_http_client_builds_successfully() {
+        pinned_http_client().expect("pinned client must build");
+    }
+}

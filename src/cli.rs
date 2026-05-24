@@ -181,6 +181,13 @@ pub enum Command {
         /// enforced).
         #[arg(long, default_value = "")]
         digest: String,
+        /// Unpadded byte count from the attachment pointer's `size` field.
+        /// When present, the decrypted plaintext is truncated to this
+        /// length, stripping signal-cli's bucket padding. Omit to keep the
+        /// raw decrypted output (still valid for formats that ignore
+        /// trailing zeros like JPEG, but byte-inexact).
+        #[arg(long)]
+        size: Option<u32>,
         /// Output path for the decrypted plaintext.
         #[arg(long)]
         dest: PathBuf,

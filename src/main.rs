@@ -324,10 +324,11 @@ async fn main() -> Result<()> {
             cdn_number,
             key,
             digest,
+            size,
             dest,
         } => {
             info!(
-                "download: cdn_id={cdn_id} cdn_key={:?} cdn_number={cdn_number} dest={}",
+                "download: cdn_id={cdn_id} cdn_key={:?} cdn_number={cdn_number} size={size:?} dest={}",
                 cdn_key,
                 dest.display()
             );
@@ -346,7 +347,7 @@ async fn main() -> Result<()> {
                 cdn_key,
                 cdn_number,
                 content_type: None,
-                size: None,
+                size,
                 digest: digest_bytes,
                 key: key_bytes,
                 file_name: None,

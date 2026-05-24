@@ -98,7 +98,7 @@ pub async fn download_attachment(pointer: &AttachmentPointer, dest: &Path) -> Re
     }
 
     let url = build_cdn_url(pointer)?;
-    let client = reqwest::Client::builder().build()?;
+    let client = crate::net::pinned_http_client()?;
     let blob = client
         .get(&url)
         .send()

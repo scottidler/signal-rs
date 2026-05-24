@@ -47,9 +47,6 @@ pub enum ApiError {
 
     #[error("rng error: {0}")]
     Rng(String),
-
-    #[error("tls config error: {0}")]
-    TlsConfig(String),
 }
 
 /// JSON body for `PUT /v1/devices/link`. Combines the provisioning
@@ -673,25 +670,11 @@ fn b64(b: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(b)
 }
 
-/// Signal's self-signed root CA. chat.signal.org presents a cert chained
-/// to this root, not to any public CA, so we must pin it explicitly.
-/// Sourced from libsignal `rust/net/res/signal.cer` (DER-encoded).
-const SIGNAL_ROOT_CERT_DER: &[u8] = include_bytes!("../res/signal.cer");
-
-/// Construct a fresh reqwest client pinned to Signal's root CA. System
-/// trust roots are excluded; only `SIGNAL_ROOT_CERT_DER` is accepted.
-/// We keep this per-call rather than pooling for v0.1; the link flow
-/// issues only two requests and the keys upload one more, so
-/// connection-reuse pressure is low.
+/// Construct a fresh reqwest client pinned to Signal's root CA. Delegates
+/// to the shared `crate::net::pinned_http_client` helper so the link/keys
+/// REST path and the attachment-download path agree on TLS trust roots.
 fn http_client() -> Result<HttpClient, ApiError> {
-    debug!("http_client: building reqwest client with Signal-pinned root CA");
-    let cert = reqwest::Certificate::from_der(SIGNAL_ROOT_CERT_DER)
-        .map_err(|e| ApiError::TlsConfig(format!("parse signal root cert: {e}")))?;
-    Ok(HttpClient::builder()
-        .user_agent(concat!("signal-rs/", env!("CARGO_PKG_VERSION")))
-        .use_rustls_tls()
-        .tls_certs_only([cert])
-        .build()?)
+    crate::net::pinned_http_client().map_err(ApiError::from)
 }
 
 #[cfg(test)]
