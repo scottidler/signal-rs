@@ -23,11 +23,13 @@ use crate::net::{self, Environment as NetEnv, NetError};
 use crate::storage::{Identity, LinkStatus, SqliteStore, Store, StoreError};
 
 mod send;
+mod status;
 #[cfg(test)]
 pub(crate) use send::{
     attachment_pointer_to_proto, build_delete_content, build_one_to_one_content, build_sync_delete_content,
     build_sync_self_content, build_typing_content,
 };
+pub use status::{ClientStatus, StatusError};
 
 const RECEIVE_CHANNEL_CAPACITY: usize = 256;
 

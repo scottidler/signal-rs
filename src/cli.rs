@@ -1,6 +1,32 @@
-use clap::{ArgGroup, Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::sync::LazyLock;
+
+/// Output format for commands that have to choose between line-delimited
+/// JSON (one record per line, machine-consumable) and a human-readable
+/// rendering. Default is left unset on the parsed value so `main.rs`
+/// resolves it at runtime via `std::io::IsTerminal` on stdout.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum Format {
+    Json,
+    Text,
+}
+
+/// Resolve the effective output format from an explicit `--format` value
+/// (if the user passed one) and whether stdout is currently a TTY.
+/// Pure function so it can be unit-tested without monkey-patching the
+/// process's actual stdout; `main.rs` supplies the `is_tty` bool from
+/// `std::io::stdout().is_terminal()`.
+pub fn format_or_default(explicit: Option<Format>, is_tty: bool) -> Format {
+    if let Some(f) = explicit {
+        return f;
+    }
+    if is_tty { Format::Text } else { Format::Json }
+}
+
+#[cfg(test)]
+mod tests;
 
 static AFTER_HELP: LazyLock<String> = LazyLock::new(after_help_text);
 
@@ -75,12 +101,31 @@ pub enum Command {
     },
 
     /// Run the receive loop, decrypting incoming envelopes and printing
-    /// them to stdout as pretty JSON.
+    /// them to stdout. JSON mode emits one `Envelope` per line (NDJSON,
+    /// `jq`-friendly); text mode renders each envelope as a human-readable
+    /// debug block. Default is determined at runtime from `IsTerminal` on
+    /// stdout: terminal -> text, non-terminal (pipe/file) -> json.
     Receive {
         /// Print one envelope and exit instead of looping. Smoke-test
         /// helper.
         #[arg(long)]
         once: bool,
+        /// Output format. Omit to auto-detect from stdout: json when
+        /// piped/redirected, text when attached to a terminal.
+        #[arg(long, value_enum)]
+        format: Option<Format>,
+    },
+
+    /// Print the local device's identity-level state plus the
+    /// server-authoritative linked-devices list (`GET /v1/devices`).
+    /// JSON mode emits a single `ClientStatus` object; text mode renders
+    /// a small key/value block. Default is determined at runtime from
+    /// `IsTerminal` on stdout.
+    Status {
+        /// Output format. Omit to auto-detect from stdout: json when
+        /// piped/redirected, text when attached to a terminal.
+        #[arg(long, value_enum)]
+        format: Option<Format>,
     },
 
     /// Send a typing indicator to a peer. Carries no body or attachments;

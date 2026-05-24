@@ -530,6 +530,77 @@ pub async fn fetch_sender_certificate(creds: &UploadCredentials) -> Result<(Vec<
     Ok((bytes, expiry_ms))
 }
 
+/// One entry of the `GET /v1/devices` response. `name` is the
+/// server-stored encrypted device name (base64); decryption is Phase 9
+/// territory and intentionally not done here. `created_ms` and
+/// `last_seen_ms` are millisecond epoch timestamps the server reports.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceEntry {
+    pub id: u32,
+    pub name: Option<String>,
+    pub created_ms: Option<u64>,
+    pub last_seen_ms: Option<u64>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct DevicesResponse {
+    devices: Vec<DevicesResponseEntry>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct DevicesResponseEntry {
+    id: u32,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    created: Option<u64>,
+    #[serde(default)]
+    last_seen: Option<u64>,
+}
+
+/// `GET /v1/devices` - list all linked devices on the account. Returns
+/// id, encrypted device name (base64), created and last-seen ms epoch
+/// timestamps. Uses the standard authenticated device credentials
+/// (`{aci}.{device_id}` : password) - the same auth as the prekey-count
+/// and sender-certificate endpoints.
+pub async fn list_devices(creds: &UploadCredentials) -> Result<Vec<DeviceEntry>, ApiError> {
+    debug!(
+        "list_devices: service_id={} device_id={}",
+        creds.service_id, creds.device_id
+    );
+    let url = format!("{CHAT_BASE_URL}/v1/devices");
+    let user = format!("{}.{}", creds.service_id, creds.device_id);
+    let auth_header = basic_auth_header(&user, &creds.password);
+
+    let client = http_client()?;
+    let resp = client.get(&url).header(AUTHORIZATION, auth_header).send().await?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(ApiError::Server {
+            status: status.as_u16(),
+            body: body_text,
+        });
+    }
+
+    let parsed: DevicesResponse = resp.json().await?;
+    let out = parsed
+        .devices
+        .into_iter()
+        .map(|d| DeviceEntry {
+            id: d.id,
+            name: d.name,
+            created_ms: d.created,
+            last_seen_ms: d.last_seen,
+        })
+        .collect::<Vec<_>>();
+    info!("list_devices: returned {} devices", out.len());
+    Ok(out)
+}
+
 /// Load a cached `SenderCertificate` from the store or fetch + cache
 /// a fresh one if the cached row is missing or its expiry is within
 /// the configured refresh window of `now_ms`. Returns the deserialized

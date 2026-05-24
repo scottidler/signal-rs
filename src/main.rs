@@ -6,11 +6,12 @@ use clap::Parser;
 use eyre::{Context, Result, eyre};
 use log::{LevelFilter, info};
 use std::fs;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use base64::Engine;
-use signal_rs::{Client, Recipient, attachment, envelope::AttachmentPointer, link::link};
+use signal_rs::{Client, ClientStatus, Envelope, Recipient, attachment, envelope::AttachmentPointer, link::link};
 
 /// Parse the `--to` argument into a typed [`Recipient`]. Accepted
 /// forms (lowercase): `self`, `aci:<uuid>`. Any other form (E.164
@@ -32,7 +33,65 @@ fn parse_recipient(s: &str) -> Result<Recipient> {
 }
 
 mod cli;
-use cli::{Cli, Command};
+use cli::{Cli, Command, Format, format_or_default};
+
+/// Resolve the effective output format. Thin wrapper around the pure
+/// [`format_or_default`] helper in `cli.rs` so the unit tests can drive
+/// the precedence logic without monkey-patching the process's stdout.
+fn resolve_format(explicit: Option<Format>) -> Format {
+    format_or_default(explicit, std::io::stdout().is_terminal())
+}
+
+/// Render a single envelope. JSON mode prints one compact line so
+/// consumers can `jq` it; text mode prints the `Debug` representation
+/// (already structured + indented) so a human can read it.
+fn print_envelope(envelope: &Envelope, format: Format) -> Result<()> {
+    match format {
+        Format::Json => {
+            let line = serde_json::to_string(envelope).context("serialize envelope to json")?;
+            println!("{line}");
+        }
+        Format::Text => {
+            println!("{envelope:#?}");
+        }
+    }
+    Ok(())
+}
+
+/// Render a `ClientStatus`. JSON mode emits a pretty-printed object
+/// (single artifact, not a stream, so indentation is fine). Text mode
+/// formats a small key/value block plus a per-device line for each
+/// entry returned by the server.
+fn print_status(status: &ClientStatus, format: Format) -> Result<()> {
+    match format {
+        Format::Json => {
+            let body = serde_json::to_string_pretty(status).context("serialize status to json")?;
+            println!("{body}");
+        }
+        Format::Text => {
+            println!("account_number: {}", status.account_number);
+            println!("device_id:      {}", status.device_id);
+            println!("aci:            {}", status.aci.as_deref().unwrap_or("<unset>"));
+            println!("pni:            {}", status.pni.as_deref().unwrap_or("<unset>"));
+            println!("link_status:    {}", status.link_status);
+            println!("linked_devices: {}", status.linked_devices.len());
+            for d in &status.linked_devices {
+                println!(
+                    "  - id={} name={} created_ms={} last_seen_ms={}",
+                    d.id,
+                    d.name.as_deref().unwrap_or("<unset>"),
+                    d.created_ms
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "<unset>".to_string()),
+                    d.last_seen_ms
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "<unset>".to_string()),
+                );
+            }
+        }
+    }
+    Ok(())
+}
 
 fn default_state_dir() -> PathBuf {
     dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("signal-rs")
@@ -160,8 +219,9 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Command::Receive { once } => {
-            info!("receive: state_dir={} once={once}", state_dir.display());
+        Command::Receive { once, format } => {
+            let fmt = resolve_format(format);
+            info!("receive: state_dir={} once={once} format={fmt:?}", state_dir.display());
             let client = Client::open(&state_dir).await.map_err(|e| eyre!("Client::open: {e}"))?;
             if once {
                 // --once: race the receive loop against the first
@@ -175,7 +235,7 @@ async fn main() -> Result<()> {
                 tokio::select! {
                     msg = rx.recv() => {
                         match msg {
-                            Ok(envelope) => println!("{envelope:#?}"),
+                            Ok(envelope) => print_envelope(&envelope, fmt)?,
                             Err(e) => eprintln!("receive: channel closed before first envelope: {e}"),
                         }
                     }
@@ -190,7 +250,7 @@ async fn main() -> Result<()> {
                 // futures are !Send so we can't spawn the loop on a
                 // separate task; tokio::select! co-runs both on the
                 // current task. Without the explicit rx.recv() arm
-                // envelopes are silently dropped — broadcast::send is
+                // envelopes are silently dropped - broadcast::send is
                 // a no-op when no receivers are attached.
                 let mut rx = client.receive();
                 let loop_fut = client.run_receive_loop();
@@ -199,7 +259,7 @@ async fn main() -> Result<()> {
                     tokio::select! {
                         msg = rx.recv() => {
                             match msg {
-                                Ok(envelope) => println!("{envelope:#?}"),
+                                Ok(envelope) => print_envelope(&envelope, fmt)?,
                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                     eprintln!("receive: lagged, dropped {n} envelopes");
                                 }
@@ -216,6 +276,14 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            Ok(())
+        }
+        Command::Status { format } => {
+            let fmt = resolve_format(format);
+            info!("status: state_dir={} format={fmt:?}", state_dir.display());
+            let client = Client::open(&state_dir).await.map_err(|e| eyre!("Client::open: {e}"))?;
+            let status = client.status().await.map_err(|e| eyre!("Client::status: {e}"))?;
+            print_status(&status, fmt)?;
             Ok(())
         }
         Command::Typing { to, start, stop } => {

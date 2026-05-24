@@ -9,6 +9,9 @@
 //!
 //! Public surface:
 //! - [`Client`] - the primary entry; one per state directory.
+//! - [`ClientStatus`] - identity-level snapshot returned by
+//!   `Client::status` (account, device, ACI/PNI, link status, server
+//!   linked-devices list).
 //! - [`Envelope`] / [`SyncMessage`] / [`Recipient`] / [`ReceiptKind`] /
 //!   [`ReadReceipt`] / [`AttachmentPointer`] - what `Client::receive`
 //!   yields. JSON-serializable for line-delimited stdout consumption.
@@ -28,7 +31,7 @@ pub mod link;
 pub mod net;
 pub mod storage;
 
-pub use client::{Client, OpenError, ReceiveError, SendError};
+pub use client::{Client, ClientStatus, OpenError, ReceiveError, SendError, StatusError};
 pub use config::Config;
 pub use envelope::{AttachmentPointer, Envelope, ReadReceipt, ReceiptKind, Recipient, SyncMessage};
 pub use link::{LinkError, LinkOutcome, finalize_link, mark_linked, persist_provision_message, prepare_link_session};

@@ -13,6 +13,7 @@ pub use sqlite::SqliteStore;
 pub use tx::TxStore;
 
 use libsignal_protocol::IdentityKeyPair;
+use serde::Serialize;
 use thiserror::Error;
 
 /// The handshake state of the linked device, persisted under `identity.link_status`.
@@ -21,13 +22,18 @@ use thiserror::Error;
 /// prekey upload to Signal's keyserver never completed; the device is silently
 /// unreachable by new peers and the operator must re-run linking to finish.
 /// `Linked` is the steady state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LinkStatus {
     IdentityPersisted,
     Linked,
 }
 
 impl LinkStatus {
+    /// On-disk form. PascalCase is the historical encoding written to
+    /// the `identity.link_status` row; changing it would require a
+    /// migration. Use [`std::fmt::Display`] for user-facing output -
+    /// that produces the snake_case form that matches the serde JSON.
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             LinkStatus::IdentityPersisted => "IdentityPersisted",
@@ -41,6 +47,20 @@ impl LinkStatus {
             "Linked" => Some(LinkStatus::Linked),
             _ => None,
         }
+    }
+}
+
+impl std::fmt::Display for LinkStatus {
+    /// Snake-case rendering for human-facing output. Mirrors the
+    /// `#[serde(rename_all = "snake_case")]` form so `signal-rs status`
+    /// reads the same in text and JSON modes. The on-disk encoding
+    /// (PascalCase via [`LinkStatus::as_str`]) is unchanged.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            LinkStatus::IdentityPersisted => "identity_persisted",
+            LinkStatus::Linked => "linked",
+        };
+        f.write_str(s)
     }
 }
 
