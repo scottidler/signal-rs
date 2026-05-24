@@ -254,6 +254,14 @@ where
     );
 
     // 4. Push the bytes to the CDN over the protocol the server chose.
+    //
+    // Asymmetric with `attachment::download_attachment`, which uses
+    // `crate::net::pinned_http_client()` (Signal-only trust). Upload
+    // cannot pin because cdn=2 posts to a GCS signed URL on
+    // `storage.googleapis.com`, which requires public-CA trust. If
+    // Signal ever returns an upload URL on a Signal-only host the right
+    // move is to switch to `add_root_certificate(signal_cert)` on top
+    // of system roots so both targets work.
     let http = reqwest::Client::builder()
         .build()
         .map_err(|e| UploadError::Form(format!("reqwest::Client::builder: {e}")))?;

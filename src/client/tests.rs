@@ -229,7 +229,7 @@ fn route_aci_destination_works_without_local_pni() {
 
 use crate::client::{
     build_delete_content, build_one_to_one_content, build_sync_delete_content, build_sync_self_content,
-    build_typing_content, decode_content, strip_signal_padding,
+    build_typing_content, decode_content, service_id_binary_to_recipient, strip_signal_padding,
 };
 use crate::crypto::provisioning::proto;
 use crate::envelope::{Envelope as PubEnvelope, ReceiptKind, Recipient, SyncMessage as PubSyncMessage};
@@ -819,4 +819,141 @@ fn decode_content_strips_padding_before_protobuf_decode() {
         panic!("expected Envelope::DataMessage, got something else");
     };
     assert_eq!(env_body.as_deref(), Some(body));
+}
+
+// =============================================================================
+// service_id_binary_to_recipient + binary-form fallback in decode_sync_message
+// =============================================================================
+//
+// Modern Signal-Android writes only the binary-form recipient fields on
+// SyncMessage::Sent.destinationServiceIdBinary and
+// SyncMessage::Read.senderAciBinary, leaving the string-form fields
+// empty. Phase 10 smoke surfaced this: a Note-to-Self sync arrived with
+// `destination: null` and a self-read receipt arrived with
+// `sender: {"aci": ""}` because the decoder only consulted the string
+// fields. These tests pin the binary-form parser and confirm
+// decode_sync_message falls back to it when strings are absent/empty.
+
+#[test]
+fn service_id_binary_to_recipient_parses_16_byte_aci() {
+    // 16-byte buffer, no prefix: ACI.
+    let bytes: [u8; 16] = [
+        0x6e, 0x9d, 0x7b, 0x6f, 0x8b, 0x7f, 0x43, 0x7f, 0x99, 0x90, 0x4f, 0x46, 0x82, 0xa6, 0x66, 0x5c,
+    ];
+    let r = service_id_binary_to_recipient(&bytes).expect("16-byte buffer parses");
+    assert_eq!(r, Recipient::Aci("6e9d7b6f-8b7f-437f-9990-4f4682a6665c".to_string()));
+}
+
+#[test]
+fn service_id_binary_to_recipient_parses_17_byte_pni_with_0x01_prefix() {
+    let mut bytes: Vec<u8> = vec![0x01];
+    bytes.extend_from_slice(&[
+        0xfe, 0xda, 0xbf, 0x68, 0xa4, 0x89, 0x43, 0x2f, 0xa6, 0xa4, 0x81, 0x0b, 0xa7, 0x56, 0x1d, 0xa4,
+    ]);
+    let r = service_id_binary_to_recipient(&bytes).expect("17-byte 0x01-prefixed buffer parses");
+    assert_eq!(r, Recipient::Pni("fedabf68-a489-432f-a6a4-810ba7561da4".to_string()));
+}
+
+#[test]
+fn service_id_binary_to_recipient_parses_17_byte_aci_with_0x00_prefix() {
+    let mut bytes: Vec<u8> = vec![0x00];
+    bytes.extend_from_slice(&[
+        0x6e, 0x9d, 0x7b, 0x6f, 0x8b, 0x7f, 0x43, 0x7f, 0x99, 0x90, 0x4f, 0x46, 0x82, 0xa6, 0x66, 0x5c,
+    ]);
+    let r = service_id_binary_to_recipient(&bytes).expect("17-byte 0x00-prefixed buffer parses");
+    assert_eq!(r, Recipient::Aci("6e9d7b6f-8b7f-437f-9990-4f4682a6665c".to_string()));
+}
+
+#[test]
+fn service_id_binary_to_recipient_rejects_other_lengths() {
+    assert!(service_id_binary_to_recipient(&[]).is_none());
+    assert!(service_id_binary_to_recipient(&[0u8; 15]).is_none());
+    assert!(service_id_binary_to_recipient(&[0u8; 18]).is_none());
+}
+
+#[test]
+fn service_id_binary_to_recipient_rejects_17_byte_unknown_prefix() {
+    let mut bytes: Vec<u8> = vec![0x02];
+    bytes.extend_from_slice(&[0u8; 16]);
+    assert!(service_id_binary_to_recipient(&bytes).is_none());
+}
+
+#[test]
+fn decode_sync_read_falls_back_to_sender_aci_binary_when_string_is_empty() {
+    use prost::Message as _;
+    let aci_bytes: [u8; 16] = [
+        0x6e, 0x9d, 0x7b, 0x6f, 0x8b, 0x7f, 0x43, 0x7f, 0x99, 0x90, 0x4f, 0x46, 0x82, 0xa6, 0x66, 0x5c,
+    ];
+    let sm = proto::SyncMessage {
+        read: vec![proto::sync_message::Read {
+            sender_aci: Some(String::new()),
+            sender_aci_binary: Some(aci_bytes.to_vec()),
+            timestamp: Some(1_700_000_000_111),
+        }],
+        ..Default::default()
+    };
+    let content = proto::Content {
+        content: Some(proto::content::Content::SyncMessage(sm)),
+        ..Default::default()
+    };
+    let plaintext = content.encode_to_vec();
+    let env = decode_content(&plaintext, ACI, 1, 0)
+        .0
+        .expect("SyncMessage::Read decodes");
+    let PubEnvelope::SyncMessage(PubSyncMessage::Read { reads }) = env else {
+        panic!("expected SyncMessage::Read, got something else");
+    };
+    assert_eq!(reads.len(), 1);
+    assert_eq!(
+        reads[0].sender,
+        Recipient::Aci("6e9d7b6f-8b7f-437f-9990-4f4682a6665c".to_string())
+    );
+    assert_eq!(reads[0].timestamp, 1_700_000_000_111);
+}
+
+#[test]
+fn decode_sync_sent_falls_back_to_destination_service_id_binary_when_string_is_empty() {
+    use prost::Message as _;
+    let aci_bytes: [u8; 16] = [
+        0x6e, 0x9d, 0x7b, 0x6f, 0x8b, 0x7f, 0x43, 0x7f, 0x99, 0x90, 0x4f, 0x46, 0x82, 0xa6, 0x66, 0x5c,
+    ];
+    let ts = 1_700_000_000_222_u64;
+    let dm = proto::DataMessage {
+        body: Some("self-sync".to_string()),
+        timestamp: Some(ts),
+        ..Default::default()
+    };
+    let sent = proto::sync_message::Sent {
+        destination_service_id: Some(String::new()),
+        destination_service_id_binary: Some(aci_bytes.to_vec()),
+        timestamp: Some(ts),
+        message: Some(dm),
+        ..Default::default()
+    };
+    let sm = proto::SyncMessage {
+        content: Some(proto::sync_message::Content::Sent(sent)),
+        ..Default::default()
+    };
+    let content = proto::Content {
+        content: Some(proto::content::Content::SyncMessage(sm)),
+        ..Default::default()
+    };
+    let plaintext = content.encode_to_vec();
+
+    // Pass the SAME ACI as the recipient so the SelfSync remap inside
+    // process_envelope would fire on Recipient::Aci(local_aci). Here we
+    // only exercise decode_content / decode_sync_message, so destination
+    // is the unmapped Recipient::Aci(...) - the important thing is that
+    // it is NOT None.
+    let env = decode_content(&plaintext, "6e9d7b6f-8b7f-437f-9990-4f4682a6665c", 1, ts)
+        .0
+        .expect("SyncMessage::Sent decodes");
+    let PubEnvelope::SyncMessage(PubSyncMessage::Sent { destination, body, .. }) = env else {
+        panic!("expected SyncMessage::Sent, got something else");
+    };
+    assert_eq!(
+        destination,
+        Some(Recipient::Aci("6e9d7b6f-8b7f-437f-9990-4f4682a6665c".to_string()))
+    );
+    assert_eq!(body.as_deref(), Some("self-sync"));
 }

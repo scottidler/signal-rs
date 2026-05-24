@@ -707,13 +707,49 @@ fn decode_content(
 /// Classify a wire `source_service_id` / `destination_service_id` string
 /// into a typed [`crate::envelope::Recipient`]. Signal uses a `PNI:`
 /// prefix on PNI service-ids; bare UUIDs are ACIs.
-fn service_id_to_recipient(s: &str) -> crate::envelope::Recipient {
+pub(crate) fn service_id_to_recipient(s: &str) -> crate::envelope::Recipient {
     use crate::envelope::Recipient;
     if let Some(pni) = s.strip_prefix("PNI:") {
         Recipient::Pni(pni.to_string())
     } else {
         Recipient::Aci(s.to_string())
     }
+}
+
+/// Classify a wire service-id BINARY form into a typed
+/// [`crate::envelope::Recipient`]. Modern Signal-Android increasingly
+/// sends only the binary form on `SyncMessage::Sent.destinationServiceIdBinary`
+/// and `SyncMessage::Read.senderAciBinary`, leaving the string field
+/// empty; readers that only consult the string field render `null` /
+/// empty-string recipients, which breaks the SelfSync remap and the
+/// Note-to-Self filter contract.
+///
+/// Encoding (per service.proto comments):
+/// - 16-byte buffer: ACI UUID, no prefix.
+/// - 17-byte buffer: 1-byte service-id kind prefix + 16-byte UUID,
+///   where `0x00` is ACI and `0x01` is PNI.
+/// - Any other length is a wire-level violation; return None and let
+///   the caller surface the failure.
+pub(crate) fn service_id_binary_to_recipient(bytes: &[u8]) -> Option<crate::envelope::Recipient> {
+    use crate::envelope::Recipient;
+    match bytes.len() {
+        16 => Some(Recipient::Aci(uuid_from_bytes(bytes))),
+        17 if bytes[0] == 0x00 => Some(Recipient::Aci(uuid_from_bytes(&bytes[1..]))),
+        17 if bytes[0] == 0x01 => Some(Recipient::Pni(uuid_from_bytes(&bytes[1..]))),
+        _ => None,
+    }
+}
+
+/// Format a 16-byte buffer as a canonical lowercase UUID string
+/// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Panics if the slice is not
+/// exactly 16 bytes; the only call sites are
+/// `service_id_binary_to_recipient` which length-gates the input first.
+fn uuid_from_bytes(b: &[u8]) -> String {
+    debug_assert_eq!(b.len(), 16, "uuid_from_bytes requires a 16-byte slice");
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+    )
 }
 
 /// The Phase 3 surface fields pulled out of a prost-generated DataMessage.
@@ -784,6 +820,11 @@ fn decode_sync_message(sm: proto::SyncMessage, fallback_timestamp: u64) -> Optio
 
     // SyncMessage.read is a `repeated` field outside the oneof; check it
     // first so a SyncMessage carrying only read-receipts still surfaces.
+    //
+    // Read receipts carry the original sender as either `senderAci`
+    // (string, tag 3) or `senderAciBinary` (16 bytes, tag 4). Modern
+    // Signal-Android writes only the binary form; prefer string when
+    // non-empty, otherwise fall through to the binary.
     if !sm.read.is_empty() {
         let reads = sm
             .read
@@ -792,7 +833,9 @@ fn decode_sync_message(sm: proto::SyncMessage, fallback_timestamp: u64) -> Optio
                 sender: r
                     .sender_aci
                     .as_deref()
+                    .filter(|s| !s.is_empty())
                     .map(service_id_to_recipient)
+                    .or_else(|| r.sender_aci_binary.as_deref().and_then(service_id_binary_to_recipient))
                     .unwrap_or(Recipient::Aci(String::new())),
                 timestamp: r.timestamp.unwrap_or(0),
             })
@@ -803,7 +846,23 @@ fn decode_sync_message(sm: proto::SyncMessage, fallback_timestamp: u64) -> Optio
     let inner = sm.content?;
     match inner {
         proto::sync_message::Content::Sent(sent) => {
-            let destination = sent.destination_service_id.as_deref().map(service_id_to_recipient);
+            // Sent destination is either `destinationServiceId` (string,
+            // tag 7) or `destinationServiceIdBinary` (bytes, tag 12).
+            // Modern Signal-Android writes only the binary form; prefer
+            // string when non-empty, otherwise fall through to the binary.
+            // Without this fallback the SelfSync remap (which keys off
+            // Some(Recipient::Aci(local_aci))) never fires, and consumers
+            // see `destination: null` for what is actually a Note-to-Self.
+            let destination = sent
+                .destination_service_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(service_id_to_recipient)
+                .or_else(|| {
+                    sent.destination_service_id_binary
+                        .as_deref()
+                        .and_then(service_id_binary_to_recipient)
+                });
             let sync_timestamp = sent.timestamp.unwrap_or(fallback_timestamp);
             // SyncMessage::Sent surfaces destination/body/attachments
             // but not the inner quote (the originating DataMessage's
