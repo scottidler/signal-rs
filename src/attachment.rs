@@ -35,6 +35,9 @@ use thiserror::Error;
 
 use crate::envelope::AttachmentPointer;
 
+pub mod upload;
+pub use upload::{UploadError, upload_attachment_bytes, upload_attachment_from_path};
+
 type Aes256CbcDec = Decryptor<Aes256>;
 type HmacSha256 = Hmac<Sha256>;
 
@@ -106,8 +109,24 @@ pub async fn download_attachment(pointer: &AttachmentPointer, dest: &Path) -> Re
         .to_vec();
     info!("download_attachment: fetched {} bytes from {}", blob.len(), url);
 
-    let plaintext = verify_and_decrypt(&blob, &pointer.key, &pointer.digest)?;
-    debug!("download_attachment: decrypted plaintext_len={}", plaintext.len());
+    let mut plaintext = verify_and_decrypt(&blob, &pointer.key, &pointer.digest)?;
+    debug!(
+        "download_attachment: decrypted plaintext_len={} pointer_size={:?}",
+        plaintext.len(),
+        pointer.size
+    );
+
+    // Strip bucket padding: signal-cli (and now our own send path) pad
+    // the plaintext up to a privacy-preserving bucket size before
+    // encrypting. The pointer carries the unpadded byte count in `size`;
+    // trust it when present so dest receives only the real bytes the
+    // sender authored, not the trailing zero pad.
+    if let Some(size) = pointer.size {
+        let size = size as usize;
+        if size <= plaintext.len() {
+            plaintext.truncate(size);
+        }
+    }
 
     let mut f = std::fs::File::create(dest)?;
     f.write_all(&plaintext)?;

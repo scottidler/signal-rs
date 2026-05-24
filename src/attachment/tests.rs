@@ -133,6 +133,115 @@ fn verify_and_decrypt_rejects_wrong_key_len() {
     ));
 }
 
+// --- Phase 6 (send-side) round-trip tests ---------------------------------
+//
+// upload::encrypt_attachment_blob is the inverse of verify_and_decrypt. Pinning
+// the contract here means a refactor of either side that breaks the cipher
+// format fails locally instead of on a live CDN.
+
+use super::upload::{bucket_padded_size, encrypt_attachment_blob};
+
+#[test]
+fn encrypt_attachment_blob_round_trips_through_verify_and_decrypt() {
+    let aes_key = [0xA1_u8; 32];
+    let hmac_key = [0x9C_u8; 32];
+    let iv = [0x71_u8; 16];
+
+    let plaintext = b"phase 6 send-side payload".to_vec();
+    let bucket = bucket_padded_size(plaintext.len());
+    let mut padded = plaintext.clone();
+    padded.resize(bucket, 0u8);
+
+    let blob = encrypt_attachment_blob(&padded, &aes_key, &hmac_key, &iv);
+    let digest = Sha256::digest(&blob).to_vec();
+
+    let mut key_full = Vec::with_capacity(64);
+    key_full.extend_from_slice(&aes_key);
+    key_full.extend_from_slice(&hmac_key);
+
+    let decrypted = verify_and_decrypt(&blob, &key_full, &digest).expect("send-side blob decrypts cleanly");
+
+    // Decrypted is the padded plaintext; the receive path truncates to
+    // pointer.size before writing dest. Verify the first plaintext.len()
+    // bytes match and the trailing pad is the zero bytes we wrote.
+    assert_eq!(&decrypted[..plaintext.len()], &plaintext[..]);
+    assert_eq!(decrypted.len(), bucket);
+    assert!(decrypted[plaintext.len()..].iter().all(|&b| b == 0));
+}
+
+#[test]
+fn bucket_padded_size_floor_is_541() {
+    // Bucket floor mirrors signal-cli's PaddingInputStream: anything
+    // <= 541 bytes pads up to 541 bytes exactly, so a tiny send doesn't
+    // tell the server "this was a one-character message".
+    assert_eq!(bucket_padded_size(0), 541);
+    assert_eq!(bucket_padded_size(1), 541);
+    assert_eq!(bucket_padded_size(541), 541);
+}
+
+#[test]
+fn bucket_padded_size_matches_signal_android_curve_at_known_points() {
+    // Pin specific values against signal-android's
+    // PaddingInputStream.getPaddedSize formula:
+    //   max(541, floor(1.05 ^ ceil(log_1.05(size))))
+    //
+    // The values below were computed off the canonical Java formula
+    // (note: `floor` on the outside, not `ceil`). If a future refactor
+    // accidentally flips floor->ceil here, every signal-rs ciphertext
+    // would land one byte above the canonical Signal bucket and become
+    // fingerprintable as non-signal-android traffic on the CDN. These
+    // tests pin the exact post-floor values to catch that regression.
+    assert_eq!(bucket_padded_size(542), 568);
+    assert_eq!(bucket_padded_size(1000), 1020);
+    assert_eq!(bucket_padded_size(4096), 4201);
+    assert_eq!(bucket_padded_size(65_536), 67_789);
+    assert_eq!(bucket_padded_size(1_000_000), 1_041_743);
+}
+
+#[test]
+fn bucket_padded_size_grows_monotonically_above_floor() {
+    // Above the floor, the bucket grows on the 1.05^N curve. We don't
+    // pin exact values (they're floating-point dependent) but require:
+    // - strictly larger than the floor
+    // - >= plaintext length (otherwise the encrypt would truncate)
+    // - monotonically non-decreasing.
+    let sizes = [542_usize, 1000, 4096, 65_536, 1_000_000];
+    let mut prev = 541_usize;
+    for s in sizes {
+        let b = bucket_padded_size(s);
+        assert!(b >= s, "bucket={b} < plaintext={s}");
+        assert!(b >= prev, "bucket={b} < prev={prev} (not monotonic)");
+        prev = b;
+    }
+}
+
+#[test]
+fn download_truncates_padded_plaintext_to_pointer_size() {
+    // The Phase 6 send path pads plaintext up to a bucket. Phase 4
+    // download must trust pointer.size and write only the unpadded
+    // bytes to dest. This test exercises verify_and_decrypt + the
+    // truncation contract directly on a hand-built bucket-padded blob.
+    let aes_key = [0x37_u8; 32];
+    let hmac_key = [0x5E_u8; 32];
+    let iv = [0x99_u8; 16];
+
+    let plaintext = b"five small bytes".to_vec();
+    let bucket = bucket_padded_size(plaintext.len());
+    let mut padded = plaintext.clone();
+    padded.resize(bucket, 0u8);
+
+    let blob = encrypt_attachment_blob(&padded, &aes_key, &hmac_key, &iv);
+    let digest = Sha256::digest(&blob).to_vec();
+    let mut key_full = Vec::with_capacity(64);
+    key_full.extend_from_slice(&aes_key);
+    key_full.extend_from_slice(&hmac_key);
+
+    let mut decrypted = verify_and_decrypt(&blob, &key_full, &digest).unwrap();
+    // Simulate Phase 4's truncation step.
+    decrypted.truncate(plaintext.len());
+    assert_eq!(decrypted, plaintext);
+}
+
 #[test]
 fn build_cdn_url_dispatches_by_cdn_number() {
     let mut p = AttachmentPointer {

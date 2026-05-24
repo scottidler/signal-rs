@@ -14,12 +14,14 @@
 //! `ClientInner`'s field visibility.
 
 use std::borrow::Cow;
+use std::path::PathBuf;
 
+use libsignal_net_chat::api::Auth;
 use libsignal_protocol::{Aci, CiphertextMessage, DeviceId, ProtocolAddress, SessionStore};
 use log::{debug, info, warn};
 
 use crate::crypto::provisioning::proto;
-use crate::envelope::Recipient;
+use crate::envelope::{AttachmentPointer, Recipient};
 use crate::net::{self, Environment as NetEnv};
 use crate::storage::StoreError;
 
@@ -53,22 +55,89 @@ impl Client {
     /// - `Recipient::Pni(_)` -> `SendError::PniSendUnsupported`.
     pub async fn send(&self, to: Recipient, body: &str) -> Result<u64, SendError> {
         debug!("Client::send: to={:?} body_len={}", to, body.len());
+        self.send_with_attachments(to, body, &[]).await
+    }
+
+    /// Send a 1:1 message with zero or more attachments. Uploads the
+    /// attachment bytes to Signal's CDN (bucket-padded + AES-CBC/HMAC
+    /// encrypted) and embeds the resulting [`AttachmentPointer`]s in
+    /// the outbound DataMessage. Returns the message timestamp.
+    ///
+    /// `attachment_paths` are local filesystem paths; each is read into
+    /// memory, encrypted, and uploaded over the authenticated chat
+    /// upload-form endpoint before the message itself dispatches.
+    pub async fn send_with_attachments(
+        &self,
+        to: Recipient,
+        body: &str,
+        attachment_paths: &[PathBuf],
+    ) -> Result<u64, SendError> {
+        debug!(
+            "Client::send_with_attachments: to={:?} body_len={} attachments={}",
+            to,
+            body.len(),
+            attachment_paths.len()
+        );
+
+        let attachments = self.upload_attachments_for_send(attachment_paths).await?;
+
         match to {
-            Recipient::SelfSync => self.send_note_to_self(body).await,
+            Recipient::SelfSync => self.send_note_to_self(body, &attachments).await,
             Recipient::Aci(uuid) => {
                 let aci = Aci::parse_from_service_id_string(&uuid)
                     .ok_or_else(|| SendError::InvalidRecipient(format!("aci uuid: {uuid}")))?;
-                self.send_to_peer_aci(aci, body).await
+                self.send_to_peer_aci(aci, body, &attachments).await
             }
             Recipient::Pni(_) => Err(SendError::PniSendUnsupported),
         }
+    }
+
+    /// Upload each path through the authenticated chat upload-form
+    /// endpoint and convert the resulting public-API [`AttachmentPointer`]
+    /// into the wire proto used by [`build_one_to_one_content`] /
+    /// [`build_sync_self_content`]. Returns an empty Vec when paths is
+    /// empty so the no-attachment send path stays a no-op.
+    async fn upload_attachments_for_send(&self, paths: &[PathBuf]) -> Result<Vec<proto::AttachmentPointer>, SendError> {
+        debug!("upload_attachments_for_send: count={}", paths.len());
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (auth_chat, events) = self
+            .open_authenticated_chat()
+            .await
+            .map_err(|e| SendError::Server(format!("open auth chat for upload: {e}")))?;
+        drop(events);
+        let auth = Auth(auth_chat);
+
+        let mut out = Vec::with_capacity(paths.len());
+        for path in paths {
+            let content_type = mime_guess_for_path(path);
+            let pointer = crate::attachment::upload::upload_attachment_from_path(&auth, path, content_type)
+                .await
+                .map_err(|e| SendError::Server(format!("upload {}: {e}", path.display())))?;
+            info!(
+                "upload_attachments_for_send: uploaded path={} cdn={} cdn_key_len={}",
+                path.display(),
+                pointer.cdn_number,
+                pointer.cdn_key.as_deref().map(|s| s.len()).unwrap_or(0)
+            );
+            out.push(attachment_pointer_to_proto(pointer));
+        }
+        auth.0.disconnect().await;
+        Ok(out)
     }
 
     /// Internal dispatch for a peer ACI target. Looks up the stored
     /// profile key and routes to sealed-sender if present, or an
     /// unsealed fallback (with a `warn!` so the operator sees the
     /// privacy downgrade) if not.
-    async fn send_to_peer_aci(&self, target: Aci, body: &str) -> Result<u64, SendError> {
+    async fn send_to_peer_aci(
+        &self,
+        target: Aci,
+        body: &str,
+        attachments: &[proto::AttachmentPointer],
+    ) -> Result<u64, SendError> {
         let target_string = target.service_id_string();
         let peer_pk = self.inner.store.get_peer_profile_key(&target_string).await?;
 
@@ -78,7 +147,7 @@ impl Client {
                 .try_into()
                 .map_err(|_| SendError::Server(format!("peer profile_key bad length: {}", pk_bytes.len())))?;
             let access_key = zkgroup::profiles::ProfileKey::create(pk_arr).derive_access_key();
-            return self.send_sealed_to_aci(target, body, access_key).await;
+            return self.send_sealed_to_aci(target, body, attachments, access_key).await;
         }
 
         // No profile key on file. The unauthenticated prekey-bundle
@@ -99,7 +168,7 @@ impl Client {
             target_string,
             known.len()
         );
-        self.send_unsealed_hotpath(target, body, &known).await
+        self.send_unsealed_hotpath(target, body, attachments, &known).await
     }
 
     /// Encrypt + dispatch via the sealed-sender path. Returns the
@@ -121,6 +190,7 @@ impl Client {
         &self,
         target: Aci,
         body: &str,
+        attachments: &[proto::AttachmentPointer],
         access_key: [u8; zkgroup::ACCESS_KEY_LEN],
     ) -> Result<u64, SendError> {
         let target_string = target.service_id_string();
@@ -166,7 +236,16 @@ impl Client {
         // 3. Encrypt for each device + dispatch. On MismatchedDevices,
         //    surgically refresh the affected sessions and retry once.
         match self
-            .encrypt_and_dispatch_sealed(&target, &target_string, body, timestamp_ms, &cert, access_key, targets)
+            .encrypt_and_dispatch_sealed(
+                &target,
+                &target_string,
+                body,
+                attachments,
+                timestamp_ms,
+                &cert,
+                access_key,
+                targets,
+            )
             .await?
         {
             SendAttempt::Ok => {
@@ -190,6 +269,7 @@ impl Client {
                         &target,
                         &target_string,
                         body,
+                        attachments,
                         timestamp_ms,
                         &cert,
                         access_key,
@@ -369,6 +449,7 @@ impl Client {
         target: &Aci,
         target_string: &str,
         body: &str,
+        attachments: &[proto::AttachmentPointer],
         timestamp_ms: u64,
         cert: &libsignal_protocol::SenderCertificate,
         access_key: [u8; zkgroup::ACCESS_KEY_LEN],
@@ -388,7 +469,7 @@ impl Client {
             timestamp_ms
         );
 
-        let content_bytes = build_one_to_one_content(body, timestamp_ms);
+        let content_bytes = build_one_to_one_content(body, timestamp_ms, attachments);
 
         // Encrypt inside one transaction so the ratchet advances for
         // every device atomically.
@@ -502,7 +583,13 @@ impl Client {
     /// existing sessions only (no bundle fetch, since the bundle fetch
     /// itself would require an access key we don't have) and dispatch
     /// via the authenticated chat. Returns the message timestamp.
-    async fn send_unsealed_hotpath(&self, target: Aci, body: &str, known: &[u32]) -> Result<u64, SendError> {
+    async fn send_unsealed_hotpath(
+        &self,
+        target: Aci,
+        body: &str,
+        attachments: &[proto::AttachmentPointer],
+        known: &[u32],
+    ) -> Result<u64, SendError> {
         use libsignal_net_chat::api::Auth;
         use libsignal_net_chat::api::messages::{AuthenticatedChatApi, SingleOutboundUnsealedMessage};
         use libsignal_protocol::ServiceId;
@@ -533,7 +620,7 @@ impl Client {
         let mut session = tx_store.session_store();
         let mut identity = tx_store.identity_store(crate::crypto::prekeys::IdentityKind::Aci);
 
-        let content_bytes = build_one_to_one_content(body, timestamp_ms);
+        let content_bytes = build_one_to_one_content(body, timestamp_ms, attachments);
         let mut outbound: Vec<SingleOutboundUnsealedMessage<CiphertextMessage>> = Vec::with_capacity(known.len());
         for &device_id_u32 in known {
             let device_id =
@@ -603,7 +690,7 @@ impl Client {
     /// Atomicity: encrypt + session-state persist run inside one
     /// `sqlx::Transaction` via TxStore, matching the receive-side
     /// contract.
-    async fn send_note_to_self(&self, body: &str) -> Result<u64, SendError> {
+    async fn send_note_to_self(&self, body: &str, attachments: &[proto::AttachmentPointer]) -> Result<u64, SendError> {
         use libsignal_net_chat::api::keys::{DeviceSpecifier, UnauthenticatedChatApi};
         use libsignal_net_chat::api::messages::{AuthenticatedChatApi, SingleOutboundUnsealedMessage};
         use libsignal_net_chat::api::{Auth, Unauth, UserBasedAuthorization};
@@ -691,7 +778,7 @@ impl Client {
             None
         };
 
-        let content_bytes = build_sync_self_content(body, &aci_string, timestamp_ms);
+        let content_bytes = build_sync_self_content(body, &aci_string, timestamp_ms, attachments);
 
         // Encrypt one ciphertext per other-device inside a single
         // transaction so session-state writes commit or roll back as a
@@ -799,19 +886,26 @@ impl Client {
 }
 
 /// Build the inner Content protobuf for a 1:1 send: a DataMessage with
-/// the body and timestamp, wrapped in the top-level Content.
-pub(crate) fn build_one_to_one_content(body: &str, timestamp: u64) -> Vec<u8> {
+/// the body, timestamp, and any attachment pointers, wrapped in the
+/// top-level Content.
+pub(crate) fn build_one_to_one_content(
+    body: &str,
+    timestamp: u64,
+    attachments: &[proto::AttachmentPointer],
+) -> Vec<u8> {
     use prost::Message as _;
 
     debug!(
-        "build_one_to_one_content: body_len={} timestamp={}",
+        "build_one_to_one_content: body_len={} timestamp={} attachments={}",
         body.len(),
-        timestamp
+        timestamp,
+        attachments.len()
     );
 
     let dm = proto::DataMessage {
         body: Some(body.to_string()),
         timestamp: Some(timestamp),
+        attachments: attachments.to_vec(),
         ..Default::default()
     };
     let content = proto::Content {
@@ -822,21 +916,29 @@ pub(crate) fn build_one_to_one_content(body: &str, timestamp: u64) -> Vec<u8> {
 }
 
 /// Build the inner Content protobuf for a Note-to-Self send: wraps the
-/// body as a DataMessage and tags it via SyncMessage::Sent so the
-/// receiver-side filter (`destination == own_number`) fires.
-pub(crate) fn build_sync_self_content(body: &str, own_destination: &str, timestamp: u64) -> Vec<u8> {
+/// body and attachment pointers as a DataMessage and tags it via
+/// SyncMessage::Sent so the receiver-side filter (`destination ==
+/// own_number`) fires.
+pub(crate) fn build_sync_self_content(
+    body: &str,
+    own_destination: &str,
+    timestamp: u64,
+    attachments: &[proto::AttachmentPointer],
+) -> Vec<u8> {
     use prost::Message as _;
 
     debug!(
-        "build_sync_self_content: body_len={} own_destination={} timestamp={}",
+        "build_sync_self_content: body_len={} own_destination={} timestamp={} attachments={}",
         body.len(),
         own_destination,
-        timestamp
+        timestamp,
+        attachments.len()
     );
 
     let dm = proto::DataMessage {
         body: Some(body.to_string()),
         timestamp: Some(timestamp),
+        attachments: attachments.to_vec(),
         ..Default::default()
     };
     let sent = proto::sync_message::Sent {
@@ -854,4 +956,72 @@ pub(crate) fn build_sync_self_content(body: &str, own_destination: &str, timesta
         ..Default::default()
     };
     content.encode_to_vec()
+}
+
+/// Map our public [`AttachmentPointer`] (returned by `upload_attachment_*`)
+/// into the prost-generated proto. The proto uses a oneof for cdn id vs
+/// cdn key plus bitflags for `voice_note`/`borderless`/`gif`; the public
+/// type keeps those flat for easier consumer use.
+pub(crate) fn attachment_pointer_to_proto(p: AttachmentPointer) -> proto::AttachmentPointer {
+    let identifier = match p.cdn_key {
+        Some(k) => Some(proto::attachment_pointer::AttachmentIdentifier::CdnKey(k)),
+        None => Some(proto::attachment_pointer::AttachmentIdentifier::CdnId(p.cdn_id)),
+    };
+    let mut flags: u32 = 0;
+    if p.voice_note {
+        flags |= proto::attachment_pointer::Flags::VoiceMessage as u32;
+    }
+    if p.borderless {
+        flags |= proto::attachment_pointer::Flags::Borderless as u32;
+    }
+    if p.gif {
+        flags |= proto::attachment_pointer::Flags::Gif as u32;
+    }
+    proto::AttachmentPointer {
+        client_uuid: None,
+        content_type: p.content_type,
+        key: Some(p.key),
+        size: p.size,
+        thumbnail: None,
+        digest: Some(p.digest),
+        incremental_mac: None,
+        chunk_size: None,
+        file_name: p.file_name,
+        flags: if flags == 0 { None } else { Some(flags) },
+        width: p.width,
+        height: p.height,
+        caption: p.caption,
+        blur_hash: p.blurhash,
+        upload_timestamp: p.upload_timestamp,
+        cdn_number: Some(p.cdn_number),
+        attachment_identifier: identifier,
+    }
+}
+
+/// Best-effort Content-Type guess from a path's extension. Recognized
+/// extensions return the canonical MIME type; unrecognized extensions
+/// fall through to `application/octet-stream` (so the pointer always
+/// carries some `content_type` when the path has an extension). Paths
+/// without any extension at all return `None`. We deliberately keep the
+/// table small: only the formats borg / signal-rs are expected to send
+/// in practice (text, images, common audio/video, generic binary).
+fn mime_guess_for_path(path: &std::path::Path) -> Option<String> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "txt" | "log" | "md" => "text/plain",
+        "json" => "application/json",
+        "yaml" | "yml" => "application/yaml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp3" => "audio/mpeg",
+        "ogg" | "oga" => "audio/ogg",
+        "wav" => "audio/wav",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    };
+    Some(mime.to_string())
 }

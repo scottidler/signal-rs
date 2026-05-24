@@ -131,15 +131,33 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Command::Send { to, message } => {
+        Command::Send {
+            to,
+            attachments,
+            message,
+        } => {
             let recipient = parse_recipient(&to)?;
-            info!("send: to={to} body_len={}", message.len());
+            info!(
+                "send: to={to} body_len={} attachments={}",
+                message.len(),
+                attachments.len()
+            );
             let client = Client::open(&state_dir).await.map_err(|e| eyre!("Client::open: {e}"))?;
-            let timestamp_ms = client
-                .send(recipient, &message)
-                .await
-                .map_err(|e| eyre!("Client::send: {e}"))?;
-            println!("send: dispatched to={to} timestamp_ms={timestamp_ms}");
+            let timestamp_ms = if attachments.is_empty() {
+                client
+                    .send(recipient, &message)
+                    .await
+                    .map_err(|e| eyre!("Client::send: {e}"))?
+            } else {
+                client
+                    .send_with_attachments(recipient, &message, &attachments)
+                    .await
+                    .map_err(|e| eyre!("Client::send_with_attachments: {e}"))?
+            };
+            println!(
+                "send: dispatched to={to} timestamp_ms={timestamp_ms} attachments={}",
+                attachments.len()
+            );
             Ok(())
         }
         Command::Receive { once } => {

@@ -62,7 +62,15 @@ pub enum Command {
         /// Recipient. Accepted forms: `self`, `aci:<uuid>`.
         #[arg(long)]
         to: String,
-        /// Message body. Wrap in quotes if it contains spaces.
+        /// Attach a file to the message. Repeat the flag to attach
+        /// multiple files. Each file is bucket-padded, AES-CBC + HMAC
+        /// encrypted, and uploaded to Signal's CDN before the message
+        /// itself is dispatched.
+        #[arg(long = "attachment", value_name = "PATH")]
+        attachments: Vec<PathBuf>,
+        /// Message body. Wrap in quotes if it contains spaces. Can be
+        /// empty (e.g. `signal-rs send --to self --attachment foo.png
+        /// ""`) when only attachments are intended.
         message: String,
     },
 

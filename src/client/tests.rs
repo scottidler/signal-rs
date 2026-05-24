@@ -235,7 +235,7 @@ use crate::envelope::{Envelope as PubEnvelope, ReceiptKind, Recipient, SyncMessa
 fn decode_content_data_message_round_trips_through_build_one_to_one() {
     let body = "hello from a peer";
     let ts = 1_700_000_000_123_u64;
-    let plaintext = build_one_to_one_content(body, ts);
+    let plaintext = build_one_to_one_content(body, ts, &[]);
 
     let (env_opt, peer_pk) = decode_content(&plaintext, ACI, 1, ts);
     let env = env_opt.expect("DataMessage Content decodes");
@@ -262,7 +262,7 @@ fn decode_content_sync_sent_round_trips_through_build_sync_self() {
     let body = "Note to Self from the phone";
     let own = "+15555550100";
     let ts = 1_700_000_000_456_u64;
-    let plaintext = build_sync_self_content(body, own, ts);
+    let plaintext = build_sync_self_content(body, own, ts, &[]);
     // Wire-envelope source is the primary's service-id; the public
     // SyncMessage::Sent.destination comes from the SyncMessage payload.
     // SelfSync remapping is done by process_envelope, not decode_content,
@@ -438,7 +438,7 @@ fn decode_content_does_not_surface_profile_key_from_sync_sent() {
     let body = "self-sync with our key";
     let own = "+15555550100";
     let ts = 1_900_000_000_u64;
-    let plaintext = build_sync_self_content(body, own, ts);
+    let plaintext = build_sync_self_content(body, own, ts, &[]);
     let (_, peer_pk) = decode_content(&plaintext, ACI, 1, ts);
     assert!(
         peer_pk.is_none(),
@@ -475,4 +475,119 @@ fn service_id_to_recipient_classifies_bare_uuid_as_aci() {
     let aci_input = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     let r = service_id_to_recipient(aci_input);
     assert_eq!(r, Recipient::Aci(aci_input.to_string()));
+}
+
+// --- Phase 6: attachment-pointer plumbing tests ---------------------------
+//
+// build_one_to_one_content and build_sync_self_content must carry through
+// any attachment pointers we give them so peers / the receive path can
+// pull the AttachmentPointer back out of the inbound Envelope. The
+// attachment_pointer_to_proto helper bridges between our public type
+// (flat bool flags + Option<String> cdn_key + plain u64 cdn_id) and
+// the proto oneof+flags layout.
+
+fn sample_pointer(cdn_key: &str) -> crate::envelope::AttachmentPointer {
+    crate::envelope::AttachmentPointer {
+        cdn_id: 0,
+        cdn_key: Some(cdn_key.to_string()),
+        cdn_number: 2,
+        content_type: Some("image/png".to_string()),
+        size: Some(1234),
+        digest: vec![0xAB; 32],
+        key: vec![0xCD; 64],
+        file_name: Some("hello.png".to_string()),
+        caption: None,
+        width: None,
+        height: None,
+        voice_note: false,
+        borderless: false,
+        gif: true,
+        upload_timestamp: Some(1_700_000_000_000),
+        blurhash: None,
+    }
+}
+
+#[test]
+fn attachment_pointer_to_proto_maps_cdn_key_to_oneof() {
+    use crate::crypto::provisioning::proto;
+    let p = sample_pointer("AAA-server-cdn-key");
+    let pp = attachment_pointer_to_proto(p);
+    match pp.attachment_identifier {
+        Some(proto::attachment_pointer::AttachmentIdentifier::CdnKey(k)) => {
+            assert_eq!(k, "AAA-server-cdn-key");
+        }
+        other => panic!("expected CdnKey identifier, got {other:?}"),
+    }
+    assert_eq!(pp.cdn_number, Some(2));
+    assert_eq!(pp.size, Some(1234));
+    assert_eq!(pp.content_type.as_deref(), Some("image/png"));
+    // Only `gif` is set in the sample → exactly the GIF flag bit.
+    assert_eq!(pp.flags, Some(proto::attachment_pointer::Flags::Gif as u32));
+}
+
+#[test]
+fn attachment_pointer_to_proto_falls_back_to_cdn_id_when_no_key() {
+    use crate::crypto::provisioning::proto;
+    let mut p = sample_pointer("ignored");
+    p.cdn_key = None;
+    p.cdn_id = 0xDEADBEEF;
+    let pp = attachment_pointer_to_proto(p);
+    match pp.attachment_identifier {
+        Some(proto::attachment_pointer::AttachmentIdentifier::CdnId(id)) => assert_eq!(id, 0xDEADBEEF),
+        other => panic!("expected CdnId identifier, got {other:?}"),
+    }
+}
+
+#[test]
+fn attachment_pointer_to_proto_combines_voice_borderless_gif_flags() {
+    use crate::crypto::provisioning::proto;
+    let mut p = sample_pointer("k");
+    p.voice_note = true;
+    p.borderless = true;
+    p.gif = true;
+    let pp = attachment_pointer_to_proto(p);
+    let expected = (proto::attachment_pointer::Flags::VoiceMessage as u32)
+        | (proto::attachment_pointer::Flags::Borderless as u32)
+        | (proto::attachment_pointer::Flags::Gif as u32);
+    assert_eq!(pp.flags, Some(expected));
+}
+
+#[test]
+fn build_one_to_one_content_carries_attachment_pointers() {
+    use prost::Message as _;
+    let p1 = attachment_pointer_to_proto(sample_pointer("key-1"));
+    let p2 = attachment_pointer_to_proto(sample_pointer("key-2"));
+    let bytes = build_one_to_one_content("hi", 1_700_000_000_000, &[p1.clone(), p2.clone()]);
+    let content = proto::Content::decode(&*bytes).expect("Content round-trips");
+    let dm = match content.content {
+        Some(proto::content::Content::DataMessage(dm)) => dm,
+        other => panic!("expected Content::DataMessage, got {other:?}"),
+    };
+    assert_eq!(dm.attachments.len(), 2);
+    assert_eq!(dm.body.as_deref(), Some("hi"));
+    assert_eq!(dm.attachments[0].size, Some(1234));
+}
+
+#[test]
+fn build_sync_self_content_carries_attachment_pointers() {
+    use prost::Message as _;
+    let p1 = attachment_pointer_to_proto(sample_pointer("self-1"));
+    let bytes = build_sync_self_content(
+        "self-body",
+        "+15555550100",
+        1_700_000_000_000,
+        std::slice::from_ref(&p1),
+    );
+    let content = proto::Content::decode(&*bytes).expect("Content round-trips");
+    let sm = match content.content {
+        Some(proto::content::Content::SyncMessage(sm)) => sm,
+        other => panic!("expected Content::SyncMessage, got {other:?}"),
+    };
+    let sent = match sm.content {
+        Some(proto::sync_message::Content::Sent(sent)) => sent,
+        other => panic!("expected SyncMessage::Sent, got {other:?}"),
+    };
+    let dm = sent.message.expect("Sent.message is set");
+    assert_eq!(dm.attachments.len(), 1);
+    assert_eq!(dm.attachments[0].size, Some(1234));
 }
