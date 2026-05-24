@@ -2,7 +2,7 @@
 
 **Author:** Scott Idler
 **Date:** 2026-05-23
-**Status:** Draft
+**Status:** Implemented
 **Review Passes Completed:** 5/5 + Architect Rounds 1-3
 
 ## Summary
@@ -817,6 +817,44 @@ worse than it found it.
   phone.
 - Mark design doc Status: Implemented.
 - Commit, bump (minor: feature additions), push.
+
+**Smoke findings (recorded post-implementation):**
+
+- *Padding strip*: real-device receive surfaced a Phase 1 defect.
+  `decode_content` fed the libsignal-decrypted plaintext directly into
+  `prost::Content::decode`, but Signal pads plaintext with `0x80`
+  followed by trailing zeros. prost interpreted the trailing
+  `0x80 0x00 ...` as a varint tag of 0 and rejected the message. Fixed
+  by adding `strip_signal_padding` ahead of the decode, plus four
+  unit tests covering the strip and one round-trip test for padded
+  plaintext through `decode_content`.
+- *Attachment-download TLS pin*: real-CDN download surfaced a Phase 6
+  defect. `src/attachment.rs` built a vanilla `reqwest::Client` that
+  used the OS trust store, but Signal's CDN (`cdn{,2,3}.signal.org`)
+  presents a chain anchored at Signal's own self-signed root
+  (`res/signal.cer`), not any public CA. `rustls-platform-verifier`
+  rejected the cert with `UnknownIssuer`. Fixed by extracting a shared
+  `crate::net::pinned_http_client()` helper and routing the download
+  path (and the existing `src/api.rs` link/keys path) through it. The
+  cert asset (`res/signal.cer`) was also untracked-but-referenced-via-
+  `include_bytes!`, so clean clones would have failed to build; the
+  asset is now tracked. Upload still uses an unpinned client because
+  cdn=2 posts to a GCS signed URL (`storage.googleapis.com`) that
+  requires public-CA trust.
+- *Download `--size` flag*: the download CLI hardcoded
+  `AttachmentPointer.size = None`, which left signal-cli's bucket
+  padding in the output file (still a valid JPEG since decoders ignore
+  trailing zeros, but byte-inexact). Added `--size` so callers can
+  pass the pointer's `size` field through and get byte-exact output.
+- *Typing indicator not e2e-verifiable against Note-to-Self*:
+  Signal-Android does not broadcast typing indicators to its own
+  linked devices when the conversation target is self (no peer to
+  notify). Phase 3 unit tests for typing decode
+  (`decode_content_typing_message_surfaces_typing_variant`) stand as
+  proxy coverage. To exercise the inbound typing-decode path in a
+  future smoke, type in a real-peer conversation; we did not do so
+  during this smoke to avoid surfacing a typing indicator to a third
+  party.
 
 ## Alternatives Considered
 
