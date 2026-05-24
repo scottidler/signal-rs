@@ -655,11 +655,20 @@ worse than it found it.
      is leaking to the server. This is signal-cli's best-effort
      posture (see `UnidentifiedAccessHelper.getAccessFor` returning
      `@Nullable`). Strict mode is Future Work; see Risks row.
-     Fetch the recipient's device list via `GET /v1/profile/{aci}`
-     regardless of which path we take.
-  3. Fetch missing prekey bundles via `GET /v2/keys/{aci}/*`,
-     one per device. Run `process_prekey_bundle` for each device
-     we don't have a session with.
+     Device-list discovery is lazy: the hot path encrypts to whatever
+     devices we already have sessions for, and the server's
+     `MismatchedDevices` 409 response (handled below) is what surfaces
+     additions / removals. This matches signal-cli's
+     `MessageSender.sendMessage` pattern. An eager
+     `GET /v1/profile/{aci}` per send would just burn an RTT on the
+     steady state; the 409-driven refetch is correct on the transient
+     and free on the steady state.
+  3. Fetch missing prekey bundles via libsignal-net-chat's
+     `UnauthenticatedChatApi::get_pre_keys(aci, AllDevices)` — same
+     server-side endpoint as `GET /v2/keys/{aci}/*`, tunnelled over
+     the unauth chat websocket rather than a parallel REST client.
+     Run `process_prekey_bundle` for each device we don't have a
+     session with.
   4. For each of the peer's `ProtocolAddress`es, call
      `libsignal_protocol::sealed_sender_encrypt(remote_address,
      &sender_certificate, content_bytes, &mut session_store,
@@ -688,12 +697,41 @@ worse than it found it.
 #### Phase 6: Send attachments
 **Model:** opus
 
-- Upload to Signal's attachment CDN: POST to
-  `/v3/attachments/form/upload` for an upload form, then PUT the
-  AES-CBC-encrypted bytes to the form's URL.
+- Upload to Signal's attachment CDN. Use libsignal-net-chat's
+  `AuthenticatedChatApi::get_upload_form(ciphertext_len)`, which
+  hits `GET /v4/attachments/form/upload` server-side (`/v3` is
+  legacy / removed from current Signal-Server; `/v4` is what
+  signal-android and signal-cli use today). The form returns
+  `{cdn: 2|3, key, headers, signed_upload_url}`; dispatch the
+  byte upload by cdn:
+  - cdn=2 (GCS resumable): POST `signed_upload_url` with the
+    form's headers (which include `x-goog-resumable: start`) and
+    `Content-Length: 0`. GCS returns 201 with a `Location` header
+    pointing at the actual resumable session URI. PUT the bytes
+    there with `Content-Type: application/octet-stream`.
+  - cdn=3 (TUS): POST `signed_upload_url` with the form's headers
+    plus `Tus-Resumable: 1.0.0`, `Upload-Length: N`, and
+    `Content-Length: 0`. The server responds with a `Location`
+    header for the upload resource. PATCH the bytes with
+    `Upload-Offset: 0`, `Content-Type:
+    application/offset+octet-stream`, `Tus-Resumable: 1.0.0`.
+- Bucket-pad the plaintext before encrypt with signal-cli's
+  `PaddingInputStream.getPaddedSize` formula:
+  `max(541, floor(1.05^ceil(log_1.05(size))))`. The outer step is
+  `floor`, not `ceil` — `ceil` would put every signal-rs
+  ciphertext one byte above the canonical bucket and let a
+  passive observer fingerprint our traffic on the CDN.
+- AES-256-CBC + HMAC-SHA256 encrypt the padded plaintext to
+  produce the wire blob `IV(16) || ciphertext || HMAC(32)`. The
+  64-byte attachment key is `AES_KEY(32) || HMAC_KEY(32)`. Digest
+  is `SHA-256(blob)`.
 - Build `AttachmentPointer` from the upload result (cdn_id,
-  cdn_key, cdn_number, digest, key) and include in outbound
-  DataMessage's `attachments` repeated field.
+  cdn_key, cdn_number, digest, key, **unpadded** `size`) and
+  include in outbound DataMessage's `attachments` repeated field.
+- Side-fix Phase 4 download: truncate the decrypted plaintext to
+  `pointer.size` before writing dest, so our own receive path
+  doesn't write the zero pad to disk now that we bucket-pad on
+  send.
 - New `Client::send_with_attachments` API.
 - Update CLI `send --attachment PATH` (may be repeated).
 - Acceptance: send a text+attachment from CLI; phone receives the
@@ -872,7 +910,7 @@ worse than it found it.
 | libsignal-service-java's SignalService.proto drifts away from what Signal-Server actually sends | Low | High | Pin the vendored proto file with a hash/version comment; cross-check against signal-cli's bundled copy at the time of vendoring; renew when bumping libsignal. |
 | Sealed sender uses TWO trust roots concurrently; libsignal's high-level wrapper only accepts one | High | High | Phase 2 bypasses `sealed_sender_decrypt` and uses `sealed_sender_decrypt_to_usmc` + manual `SenderCertificate::validate` against an iterator of trust roots from `signal-cli/.../LiveConfig.java`. Architect Round 1 finding 1. |
 | Sealed sender decrypt needs a server-provided sender certificate we don't have today | Low | Med | Phase 2 unwraps the `SenderCertificate` from the USMC itself; nothing fetched. |
-| Sealed-sender SEND path requires our own `SenderCertificate` + recipient profile-key lookup | Med | High | Phase 5 fetches our cert via `GET /v1/certificate/delivery` and caches with expiry; profile-key lookup via `GET /v1/profile/{aci}`. signal-cli `MessageSender`/`ProfileService` is the reference. Without this, peer sends leak identity to the server (Architect Round 1 finding 2). |
+| Sealed-sender SEND path requires our own `SenderCertificate` + recipient profile-key lookup | Med | High | Phase 5 fetches our cert via `GET /v1/certificate/delivery` and caches with expiry; profile-key lookup is from local store (populated from inbound `DataMessage.profile_key` on prior peer messages). signal-cli `MessageSender`/`ProfileService` is the reference. Without this, peer sends leak identity to the server (Architect Round 1 finding 2). |
 | Attachment CDN URL format / CDN authentication changes | Low | Med | Phase 4 mirrors signal-cli's `AttachmentHelper.retrieveAttachment` exactly; cross-check `cdn0`, `cdn2`, `cdn3` paths against `cdn_number`. |
 | Multi-device peer fan-out: a peer with multiple linked devices needs one ciphertext per device, plus a `MismatchedDevices` retry path when our cached device list goes stale | Med | Med | Phase 5 generalises today's send_to_aci multi-device pattern. Explicit handling for HTTP 409 `MismatchedDevices` to refetch and retry once. signal-cli's `MessageSender` is the reference. |
 | Phase 5 sealed-sender encrypt path falls back to unsealed when we lack a profile key | Med | Med | Best-effort policy mirroring signal-cli's `UnidentifiedAccessHelper.getAccessFor` (returns @Nullable; null falls through to unsealed): try sealed sender first; if no profile key on file, fall back to unsealed `message_encrypt` and emit `warn!("sealed-sender unavailable for {recipient}, falling back to unsealed; sender identity leaks to server")`. v1 has no profile-key source besides inline `DataMessage.profile_key` (contacts backfill from `SyncMessage::Contacts` is explicitly deferred per Non-Goals), so a strict refuse policy would gate Goal 5 on a deferred feature. Strict-only mode (refuse-on-missing-profile-key) lands in Future Work once profile-key sync is implemented. Architect Round 2 consensus. |
