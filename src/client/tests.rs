@@ -228,7 +228,8 @@ fn route_aci_destination_works_without_local_pni() {
 // a production-smoke regression.
 
 use crate::client::{
-    build_delete_content, build_one_to_one_content, build_sync_self_content, build_typing_content, decode_content,
+    build_delete_content, build_one_to_one_content, build_sync_delete_content, build_sync_self_content,
+    build_typing_content, decode_content,
 };
 use crate::crypto::provisioning::proto;
 use crate::envelope::{Envelope as PubEnvelope, ReceiptKind, Recipient, SyncMessage as PubSyncMessage};
@@ -640,6 +641,35 @@ fn build_typing_content_round_trips_through_decode_content_as_typing_envelope() 
     };
     assert!(started);
     assert_eq!(timestamp, ts);
+}
+
+#[test]
+fn build_sync_delete_content_wraps_delete_data_message_inside_sync_sent_addressed_to_peer() {
+    // For the own-device sync of a remote delete: the SyncMessage::Sent
+    // names the PEER (whose thread is being modified) as the destination,
+    // and carries a DataMessage whose only field is the delete tombstone.
+    use prost::Message as _;
+    let peer = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    let target = 1_700_000_000_777_u64;
+    let now = 1_700_000_000_888_u64;
+    let bytes = build_sync_delete_content(peer, target, now);
+    let content = proto::Content::decode(&*bytes).expect("Content round-trips");
+    let sm = match content.content {
+        Some(proto::content::Content::SyncMessage(sm)) => sm,
+        other => panic!("expected Content::SyncMessage, got {other:?}"),
+    };
+    let sent = match sm.content {
+        Some(proto::sync_message::Content::Sent(sent)) => sent,
+        other => panic!("expected SyncMessage::Sent, got {other:?}"),
+    };
+    assert_eq!(sent.destination_service_id.as_deref(), Some(peer));
+    assert_eq!(sent.timestamp, Some(now));
+    let dm = sent.message.expect("Sent.message is set");
+    assert!(dm.body.is_none(), "no body on a sync-delete payload");
+    assert!(dm.attachments.is_empty(), "no attachments on a sync-delete payload");
+    assert_eq!(dm.timestamp, Some(now));
+    let delete = dm.delete.expect("delete field set");
+    assert_eq!(delete.target_sent_timestamp, Some(target));
 }
 
 #[test]

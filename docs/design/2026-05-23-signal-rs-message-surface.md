@@ -741,12 +741,33 @@ worse than it found it.
 **Model:** sonnet
 
 - `Client::typing(Recipient, started)`: build a `TypingMessage`
-  proto with `started` action and target service id, encrypt as a
-  DataMessage variant (typing messages share the encryption path
-  with regular DataMessages), send.
+  proto with the `started` action (the proto carries `timestamp`,
+  `action`, and optional `groupId` only; the target ACI is the
+  *envelope* recipient, not a field on `TypingMessage` itself - an
+  earlier draft of this bullet mistakenly named a "target service id"
+  field that does not exist in `service.proto`). Encrypt + send
+  through the same sealed-sender peer dispatch path as
+  `Client::send` (typing rides the DataMessage encryption flow; it
+  differs only in the Content oneof variant carried inside).
 - `Client::delete_for_everyone(Recipient, target_timestamp)`:
   build a `DataMessage` with the `delete: Delete { target_sent_timestamp }`
-  field set, no body, no attachments. Send.
+  field set, no body, no attachments. Two-step dispatch:
+  1. Send the bare DataMessage to the peer's devices via the same
+     sealed-sender peer dispatch path used by `Client::send`.
+  2. **After the peer dispatch succeeds**, also wrap that same
+     DataMessage in a `SyncMessage::Sent { destination =
+     <peer-ACI>, message = <delete-DataMessage> }` and dispatch
+     to the user's own OTHER linked devices via `send_sync_message`.
+     Without this second step the message vanishes from the peer's
+     phone but stays visible on the user's own iPad / desktop -
+     signal-cli and signal-android both fire this sync; an earlier
+     revision of this bullet missed it (caught by Architect Round 3,
+     post-Phase-7 implementation audit).
+     The sync is **best-effort**: if the sync dispatch fails, the
+     peer delete has already landed and returning Err to the caller
+     would be misleading; instead `warn!` and continue. The user can
+     trigger a manual re-sync later (sync-mechanism for that is
+     post-v1 Future Work).
 - CLI: `signal-rs typing --to ... --start|--stop`.
 - CLI: `signal-rs delete --to ... --target-timestamp ...`.
 

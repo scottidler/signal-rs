@@ -25,8 +25,8 @@ use crate::storage::{Identity, LinkStatus, SqliteStore, Store, StoreError};
 mod send;
 #[cfg(test)]
 pub(crate) use send::{
-    attachment_pointer_to_proto, build_delete_content, build_one_to_one_content, build_sync_self_content,
-    build_typing_content,
+    attachment_pointer_to_proto, build_delete_content, build_one_to_one_content, build_sync_delete_content,
+    build_sync_self_content, build_typing_content,
 };
 
 const RECEIVE_CHANNEL_CAPACITY: usize = 256;

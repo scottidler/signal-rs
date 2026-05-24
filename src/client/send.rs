@@ -141,8 +141,30 @@ impl Client {
             Recipient::Pni(_) => return Err(SendError::PniSendUnsupported),
         };
         let timestamp_ms = now_millis();
-        let content_bytes = build_delete_content(target_timestamp, timestamp_ms);
-        self.dispatch_to_peer_aci(aci, &content_bytes, timestamp_ms).await?;
+
+        // 1. Fan the delete out to the peer's devices. If this fails the
+        //    delete never lands on the contact's phone and surfacing the
+        //    error to the caller is correct.
+        let peer_content = build_delete_content(target_timestamp, timestamp_ms);
+        self.dispatch_to_peer_aci(aci, &peer_content, timestamp_ms).await?;
+
+        // 2. Sync the tombstone to our own OTHER linked devices so they
+        //    also remove the message from the thread. Best-effort:
+        //    the peer-side delete has already landed at this point, so
+        //    returning Err here would mislead the caller. signal-cli
+        //    follows the same pattern (peer dispatch first, then a
+        //    SyncMessage::Sent carrying the delete; the sync failure is
+        //    a UX regression on own devices, not a delete failure).
+        let peer_destination = aci.service_id_string();
+        let sync_content = build_sync_delete_content(&peer_destination, target_timestamp, timestamp_ms);
+        if let Err(e) = self.dispatch_sync_to_own_devices(&sync_content, timestamp_ms).await {
+            warn!(
+                "delete_for_everyone: peer delete to {} landed but sync to own devices failed: {}; \
+                 the message will remain visible on this user's other linked devices until they are \
+                 re-synced",
+                peer_destination, e
+            );
+        }
         Ok(())
     }
 
@@ -748,15 +770,57 @@ impl Client {
     /// `sqlx::Transaction` via TxStore, matching the receive-side
     /// contract.
     async fn send_note_to_self(&self, body: &str, attachments: &[proto::AttachmentPointer]) -> Result<u64, SendError> {
+        let timestamp_ms = now_millis();
+        debug!(
+            "send_note_to_self: body_len={} timestamp_ms={}",
+            body.len(),
+            timestamp_ms
+        );
+
+        let aci_string = self
+            .inner
+            .store
+            .get_aci()
+            .await?
+            .ok_or(SendError::MissingCredential("aci"))?;
+        let content_bytes = build_sync_self_content(body, &aci_string, timestamp_ms, attachments);
+        self.dispatch_sync_to_own_devices(&content_bytes, timestamp_ms).await?;
+        Ok(timestamp_ms)
+    }
+
+    /// Encrypt a pre-built SyncMessage `Content` payload for every OTHER
+    /// linked device on our account and dispatch via the authenticated
+    /// chat's `send_sync_message`. Returns once the chat-server has
+    /// accepted the fan-out (or short-circuits with `Ok(())` if we have
+    /// no other devices yet).
+    ///
+    /// Two callers today:
+    /// - Note-to-Self (`send_note_to_self`): syncs the user's own
+    ///   `SyncMessage::Sent` transcript so other devices see the message.
+    /// - Remote delete (`Client::delete_for_everyone`): syncs the
+    ///   delete tombstone so the user's other devices also remove the
+    ///   message from their thread (the peer delete is a separate
+    ///   call; this one only handles own-device fan-out).
+    ///
+    /// `content_bytes` must already encode a top-level
+    /// `Content::SyncMessage(...)` payload; the caller decides the
+    /// inner shape (Sent for transcripts, Sent-with-delete for
+    /// tombstones, etc.). `timestamp_ms` is the wire-level send
+    /// timestamp and must match the one embedded in the SyncMessage
+    /// (per the receive-side correlation contract).
+    ///
+    /// Atomicity: encrypt + session-state persist run inside one
+    /// `sqlx::Transaction` via TxStore, matching the receive-side
+    /// contract from Phase 6.
+    async fn dispatch_sync_to_own_devices(&self, content_bytes: &[u8], timestamp_ms: u64) -> Result<(), SendError> {
         use libsignal_net_chat::api::keys::{DeviceSpecifier, UnauthenticatedChatApi};
         use libsignal_net_chat::api::messages::{AuthenticatedChatApi, SingleOutboundUnsealedMessage};
         use libsignal_net_chat::api::{Auth, Unauth, UserBasedAuthorization};
         use libsignal_protocol::ServiceId;
 
-        let timestamp_ms = now_millis();
         debug!(
-            "send_note_to_self: body_len={} timestamp_ms={}",
-            body.len(),
+            "dispatch_sync_to_own_devices: content_len={} timestamp_ms={}",
+            content_bytes.len(),
             timestamp_ms
         );
 
@@ -824,18 +888,16 @@ impl Client {
                 .collect();
             if bundles.is_empty() {
                 info!(
-                    "send_note_to_self: no other devices to sync to (we are the only device); \
+                    "dispatch_sync_to_own_devices: no other devices to sync to (we are the only device); \
                      no-op timestamp_ms={}",
                     timestamp_ms
                 );
-                return Ok(timestamp_ms);
+                return Ok(());
             }
             Some(bundles)
         } else {
             None
         };
-
-        let content_bytes = build_sync_self_content(body, &aci_string, timestamp_ms, attachments);
 
         // Encrypt one ciphertext per other-device inside a single
         // transaction so session-state writes commit or roll back as a
@@ -868,7 +930,7 @@ impl Client {
                 .await?;
 
                 let ciphertext = libsignal_protocol::message_encrypt(
-                    &content_bytes,
+                    content_bytes,
                     &remote_address,
                     &local_address,
                     &mut session,
@@ -891,7 +953,7 @@ impl Client {
                 let remote_address = ProtocolAddress::new(aci_string.clone(), device_id);
 
                 let ciphertext = libsignal_protocol::message_encrypt(
-                    &content_bytes,
+                    content_bytes,
                     &remote_address,
                     &local_address,
                     &mut session,
@@ -933,12 +995,12 @@ impl Client {
         .map_err(|e| SendError::Server(format!("send_sync_message: {e:?}")))?;
 
         info!(
-            "send_note_to_self: dispatched body_len={} to {} other device(s) timestamp_ms={}",
-            body.len(),
+            "dispatch_sync_to_own_devices: dispatched content_len={} to {} other device(s) timestamp_ms={}",
+            content_bytes.len(),
             outbound.len(),
             timestamp_ms
         );
-        Ok(timestamp_ms)
+        Ok(())
     }
 }
 
@@ -1021,6 +1083,49 @@ pub(crate) fn build_delete_content(target_sent_timestamp: u64, timestamp: u64) -
     };
     let content = proto::Content {
         content: Some(proto::content::Content::DataMessage(dm)),
+        ..Default::default()
+    };
+    content.encode_to_vec()
+}
+
+/// Build the inner Content protobuf for the *sync* half of a remote
+/// delete: wraps a `DataMessage` whose only meaningful field is
+/// `delete.target_sent_timestamp` inside a `SyncMessage::Sent` whose
+/// `destination_service_id` names the *peer* whose message was deleted.
+/// Sent to the user's own OTHER linked devices so they also remove the
+/// targeted message from the thread.
+///
+/// Symmetric to [`build_delete_content`] but for the own-device fan-out;
+/// the peer fan-out uses the bare `DataMessage` shape because the peer
+/// has no concept of "the user deleted a message in our thread - here
+/// is the transcript you should mirror," only "delete this id."
+pub(crate) fn build_sync_delete_content(peer_destination: &str, target_sent_timestamp: u64, timestamp: u64) -> Vec<u8> {
+    use prost::Message as _;
+
+    debug!(
+        "build_sync_delete_content: peer_destination={} target_sent_timestamp={} timestamp={}",
+        peer_destination, target_sent_timestamp, timestamp
+    );
+
+    let dm = proto::DataMessage {
+        timestamp: Some(timestamp),
+        delete: Some(proto::data_message::Delete {
+            target_sent_timestamp: Some(target_sent_timestamp),
+        }),
+        ..Default::default()
+    };
+    let sent = proto::sync_message::Sent {
+        destination_service_id: Some(peer_destination.to_string()),
+        timestamp: Some(timestamp),
+        message: Some(dm),
+        ..Default::default()
+    };
+    let sm = proto::SyncMessage {
+        content: Some(proto::sync_message::Content::Sent(sent)),
+        ..Default::default()
+    };
+    let content = proto::Content {
+        content: Some(proto::content::Content::SyncMessage(sm)),
         ..Default::default()
     };
     content.encode_to_vec()
