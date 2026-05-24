@@ -227,7 +227,9 @@ fn route_aci_destination_works_without_local_pni() {
 // either the proto or the mapping is caught locally rather than through
 // a production-smoke regression.
 
-use crate::client::{build_one_to_one_content, build_sync_self_content, decode_content};
+use crate::client::{
+    build_delete_content, build_one_to_one_content, build_sync_self_content, build_typing_content, decode_content,
+};
 use crate::crypto::provisioning::proto;
 use crate::envelope::{Envelope as PubEnvelope, ReceiptKind, Recipient, SyncMessage as PubSyncMessage};
 
@@ -590,4 +592,141 @@ fn build_sync_self_content_carries_attachment_pointers() {
     let dm = sent.message.expect("Sent.message is set");
     assert_eq!(dm.attachments.len(), 1);
     assert_eq!(dm.attachments[0].size, Some(1234));
+}
+
+// --- Phase 7: typing + remote-delete builders --------------------------
+//
+// build_typing_content wraps a TypingMessage in a Content; build_delete_content
+// wraps a DataMessage with the `delete` field set. Both must round-trip through
+// prost so the wire bytes our peer dispatch sends are decodable.
+
+#[test]
+fn build_typing_content_started_decodes_to_typing_started() {
+    use prost::Message as _;
+    let ts = 1_700_000_000_111_u64;
+    let bytes = build_typing_content(true, ts);
+    let content = proto::Content::decode(&*bytes).expect("Content round-trips");
+    let tm = match content.content {
+        Some(proto::content::Content::TypingMessage(tm)) => tm,
+        other => panic!("expected Content::TypingMessage, got {other:?}"),
+    };
+    assert_eq!(tm.timestamp, Some(ts));
+    assert_eq!(tm.action(), proto::typing_message::Action::Started);
+    assert!(tm.group_id.is_none());
+}
+
+#[test]
+fn build_typing_content_stopped_decodes_to_typing_stopped() {
+    use prost::Message as _;
+    let ts = 1_700_000_000_222_u64;
+    let bytes = build_typing_content(false, ts);
+    let content = proto::Content::decode(&*bytes).expect("Content round-trips");
+    let tm = match content.content {
+        Some(proto::content::Content::TypingMessage(tm)) => tm,
+        other => panic!("expected Content::TypingMessage, got {other:?}"),
+    };
+    assert_eq!(tm.action(), proto::typing_message::Action::Stopped);
+}
+
+#[test]
+fn build_typing_content_round_trips_through_decode_content_as_typing_envelope() {
+    // The peer-side public surface (decode_content) must surface a
+    // build_typing_content blob as Envelope::Typing.
+    let ts = 1_700_000_000_333_u64;
+    let bytes = build_typing_content(true, ts);
+    let env = decode_content(&bytes, ACI, 1, ts).0.expect("Typing decodes");
+    let PubEnvelope::Typing { started, timestamp, .. } = env else {
+        panic!("expected Envelope::Typing");
+    };
+    assert!(started);
+    assert_eq!(timestamp, ts);
+}
+
+#[test]
+fn build_delete_content_carries_target_sent_timestamp_in_data_message_delete() {
+    use prost::Message as _;
+    let target = 1_700_000_000_555_u64;
+    let now = 1_700_000_000_999_u64;
+    let bytes = build_delete_content(target, now);
+    let content = proto::Content::decode(&*bytes).expect("Content round-trips");
+    let dm = match content.content {
+        Some(proto::content::Content::DataMessage(dm)) => dm,
+        other => panic!("expected Content::DataMessage, got {other:?}"),
+    };
+    // No body, no attachments - just timestamp + delete.
+    assert!(dm.body.is_none());
+    assert!(dm.attachments.is_empty());
+    assert_eq!(dm.timestamp, Some(now));
+    let delete = dm.delete.expect("delete field set");
+    assert_eq!(delete.target_sent_timestamp, Some(target));
+}
+
+#[tokio::test]
+async fn typing_to_self_recipient_rejects_with_invalid_recipient() {
+    use crate::envelope::Recipient;
+    let (tmp, _) = linked_state_dir().await;
+    let client = Client::open(tmp.path()).await.unwrap();
+    match client.typing(Recipient::SelfSync, true).await {
+        Err(SendError::InvalidRecipient(_)) => {}
+        other => panic!("expected InvalidRecipient, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn typing_to_pni_recipient_rejects_with_pni_send_unsupported() {
+    use crate::envelope::Recipient;
+    let (tmp, _) = linked_state_dir().await;
+    let client = Client::open(tmp.path()).await.unwrap();
+    let pni = Recipient::Pni("cccccccc-cccc-cccc-cccc-cccccccccccc".to_string());
+    match client.typing(pni, true).await {
+        Err(SendError::PniSendUnsupported) => {}
+        other => panic!("expected PniSendUnsupported, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn typing_to_aci_without_session_or_profile_key_errors_with_no_profile_key() {
+    use crate::envelope::Recipient;
+    let (tmp, _) = linked_state_dir().await;
+    let client = Client::open(tmp.path()).await.unwrap();
+    let peer = Recipient::Aci("22222222-2222-2222-2222-222222222222".to_string());
+    match client.typing(peer, true).await {
+        Err(SendError::NoProfileKey(_)) => {}
+        other => panic!("expected NoProfileKey, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn delete_for_everyone_to_self_recipient_rejects_with_invalid_recipient() {
+    use crate::envelope::Recipient;
+    let (tmp, _) = linked_state_dir().await;
+    let client = Client::open(tmp.path()).await.unwrap();
+    match client.delete_for_everyone(Recipient::SelfSync, 1_700_000_000_000).await {
+        Err(SendError::InvalidRecipient(_)) => {}
+        other => panic!("expected InvalidRecipient, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn delete_for_everyone_to_pni_recipient_rejects_with_pni_send_unsupported() {
+    use crate::envelope::Recipient;
+    let (tmp, _) = linked_state_dir().await;
+    let client = Client::open(tmp.path()).await.unwrap();
+    let pni = Recipient::Pni("dddddddd-dddd-dddd-dddd-dddddddddddd".to_string());
+    match client.delete_for_everyone(pni, 1_700_000_000_000).await {
+        Err(SendError::PniSendUnsupported) => {}
+        other => panic!("expected PniSendUnsupported, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn delete_for_everyone_to_aci_without_session_or_profile_key_errors_with_no_profile_key() {
+    use crate::envelope::Recipient;
+    let (tmp, _) = linked_state_dir().await;
+    let client = Client::open(tmp.path()).await.unwrap();
+    let peer = Recipient::Aci("33333333-3333-3333-3333-333333333333".to_string());
+    match client.delete_for_everyone(peer, 1_700_000_000_000).await {
+        Err(SendError::NoProfileKey(_)) => {}
+        other => panic!("expected NoProfileKey, got {:?}", other),
+    }
 }

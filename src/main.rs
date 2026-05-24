@@ -218,6 +218,38 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Typing { to, start, stop } => {
+            let recipient = parse_recipient(&to)?;
+            // ArgGroup ensures exactly one of start/stop is set; map to
+            // the bool the library API takes.
+            let started = if start {
+                true
+            } else if stop {
+                false
+            } else {
+                // Defensive: ArgGroup should have rejected this at parse time.
+                return Err(eyre!("--start or --stop is required"));
+            };
+            info!("typing: to={to} started={started}");
+            let client = Client::open(&state_dir).await.map_err(|e| eyre!("Client::open: {e}"))?;
+            client
+                .typing(recipient, started)
+                .await
+                .map_err(|e| eyre!("Client::typing: {e}"))?;
+            println!("typing: dispatched to={to} started={started}");
+            Ok(())
+        }
+        Command::Delete { to, target_timestamp } => {
+            let recipient = parse_recipient(&to)?;
+            info!("delete: to={to} target_timestamp={target_timestamp}");
+            let client = Client::open(&state_dir).await.map_err(|e| eyre!("Client::open: {e}"))?;
+            client
+                .delete_for_everyone(recipient, target_timestamp)
+                .await
+                .map_err(|e| eyre!("Client::delete_for_everyone: {e}"))?;
+            println!("delete: dispatched to={to} target_timestamp={target_timestamp}");
+            Ok(())
+        }
         Command::Download {
             cdn_id,
             cdn_key,

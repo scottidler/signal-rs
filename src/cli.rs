@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
@@ -81,6 +81,36 @@ pub enum Command {
         /// helper.
         #[arg(long)]
         once: bool,
+    },
+
+    /// Send a typing indicator to a peer. Carries no body or attachments;
+    /// peer clients display "... is typing" until the typing-stopped
+    /// indicator arrives or a real message lands. Only `aci:<uuid>`
+    /// recipients are accepted - typing to self is meaningless.
+    #[command(group(ArgGroup::new("typing_action").required(true).args(["start", "stop"])))]
+    Typing {
+        /// Recipient. Accepted form: `aci:<uuid>`.
+        #[arg(long)]
+        to: String,
+        /// Send the typing-started indicator.
+        #[arg(long)]
+        start: bool,
+        /// Send the typing-stopped indicator.
+        #[arg(long)]
+        stop: bool,
+    },
+
+    /// Send a remote-delete request for a previously-sent message. The
+    /// target timestamp is the millisecond send-timestamp the original
+    /// `send` returned (or that the receiving envelope carried). Only
+    /// `aci:<uuid>` recipients are accepted.
+    Delete {
+        /// Recipient. Accepted form: `aci:<uuid>`.
+        #[arg(long)]
+        to: String,
+        /// Millisecond send-timestamp of the message being deleted.
+        #[arg(long)]
+        target_timestamp: u64,
     },
 
     /// Download and decrypt an attachment from Signal's CDN. The pointer

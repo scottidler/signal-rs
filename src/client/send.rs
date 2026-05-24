@@ -86,10 +86,64 @@ impl Client {
             Recipient::Aci(uuid) => {
                 let aci = Aci::parse_from_service_id_string(&uuid)
                     .ok_or_else(|| SendError::InvalidRecipient(format!("aci uuid: {uuid}")))?;
-                self.send_to_peer_aci(aci, body, &attachments).await
+                let timestamp_ms = now_millis();
+                let content_bytes = build_one_to_one_content(body, timestamp_ms, &attachments);
+                self.dispatch_to_peer_aci(aci, &content_bytes, timestamp_ms).await?;
+                Ok(timestamp_ms)
             }
             Recipient::Pni(_) => Err(SendError::PniSendUnsupported),
         }
+    }
+
+    /// Send a typing indicator (`started=true` for typing-started,
+    /// `started=false` for typing-stopped) to a peer ACI. The
+    /// `TypingMessage` proto rides the same sealed-sender peer dispatch
+    /// path used by [`Client::send`] - it shares the encryption flow
+    /// with regular DataMessages and only differs in the Content oneof
+    /// variant carried inside.
+    ///
+    /// Only [`Recipient::Aci`] is supported; SelfSync and Pni return
+    /// errors (typing-to-self is meaningless and PNI sends are out of
+    /// scope per the design doc).
+    pub async fn typing(&self, to: Recipient, started: bool) -> Result<(), SendError> {
+        debug!("Client::typing: to={:?} started={}", to, started);
+        let aci = match to {
+            Recipient::Aci(uuid) => Aci::parse_from_service_id_string(&uuid)
+                .ok_or_else(|| SendError::InvalidRecipient(format!("aci uuid: {uuid}")))?,
+            Recipient::SelfSync => return Err(SendError::InvalidRecipient("typing to self".into())),
+            Recipient::Pni(_) => return Err(SendError::PniSendUnsupported),
+        };
+        let timestamp_ms = now_millis();
+        let content_bytes = build_typing_content(started, timestamp_ms);
+        self.dispatch_to_peer_aci(aci, &content_bytes, timestamp_ms).await?;
+        Ok(())
+    }
+
+    /// Send a remote-delete request for a previously-sent message
+    /// (`target_timestamp` is the millisecond send-timestamp of the
+    /// message being deleted, returned by an earlier [`Client::send`]
+    /// or pulled off an inbound envelope). Builds a `DataMessage` with
+    /// the `delete: Delete { target_sent_timestamp }` field populated
+    /// and no body / no attachments, then dispatches via the same
+    /// peer path used by [`Client::send`].
+    ///
+    /// Only [`Recipient::Aci`] is supported; SelfSync and Pni return
+    /// errors.
+    pub async fn delete_for_everyone(&self, to: Recipient, target_timestamp: u64) -> Result<(), SendError> {
+        debug!(
+            "Client::delete_for_everyone: to={:?} target_timestamp={}",
+            to, target_timestamp
+        );
+        let aci = match to {
+            Recipient::Aci(uuid) => Aci::parse_from_service_id_string(&uuid)
+                .ok_or_else(|| SendError::InvalidRecipient(format!("aci uuid: {uuid}")))?,
+            Recipient::SelfSync => return Err(SendError::InvalidRecipient("delete to self".into())),
+            Recipient::Pni(_) => return Err(SendError::PniSendUnsupported),
+        };
+        let timestamp_ms = now_millis();
+        let content_bytes = build_delete_content(target_timestamp, timestamp_ms);
+        self.dispatch_to_peer_aci(aci, &content_bytes, timestamp_ms).await?;
+        Ok(())
     }
 
     /// Upload each path through the authenticated chat upload-form
@@ -132,12 +186,19 @@ impl Client {
     /// profile key and routes to sealed-sender if present, or an
     /// unsealed fallback (with a `warn!` so the operator sees the
     /// privacy downgrade) if not.
-    async fn send_to_peer_aci(
+    ///
+    /// `content_bytes` is the encoded Signal `Content` protobuf the
+    /// caller wants to deliver (a one-to-one DataMessage, a
+    /// TypingMessage, a remote-delete DataMessage, etc.); the dispatch
+    /// path is payload-agnostic. `timestamp_ms` must be the same
+    /// timestamp embedded in `content_bytes` so the wire-level
+    /// send-timestamp and the in-Content timestamp agree.
+    async fn dispatch_to_peer_aci(
         &self,
         target: Aci,
-        body: &str,
-        attachments: &[proto::AttachmentPointer],
-    ) -> Result<u64, SendError> {
+        content_bytes: &[u8],
+        timestamp_ms: u64,
+    ) -> Result<(), SendError> {
         let target_string = target.service_id_string();
         let peer_pk = self.inner.store.get_peer_profile_key(&target_string).await?;
 
@@ -147,7 +208,9 @@ impl Client {
                 .try_into()
                 .map_err(|_| SendError::Server(format!("peer profile_key bad length: {}", pk_bytes.len())))?;
             let access_key = zkgroup::profiles::ProfileKey::create(pk_arr).derive_access_key();
-            return self.send_sealed_to_aci(target, body, attachments, access_key).await;
+            return self
+                .send_sealed_to_aci(target, content_bytes, timestamp_ms, access_key)
+                .await;
         }
 
         // No profile key on file. The unauthenticated prekey-bundle
@@ -163,12 +226,13 @@ impl Client {
             return Err(SendError::NoProfileKey(target_string));
         }
         warn!(
-            "send_to_peer_aci: no profile key for {} - falling back to unsealed send over \
+            "dispatch_to_peer_aci: no profile key for {} - falling back to unsealed send over \
              existing sessions ({} device(s)); this leaks sender identity to the server",
             target_string,
             known.len()
         );
-        self.send_unsealed_hotpath(target, body, attachments, &known).await
+        self.send_unsealed_hotpath(target, content_bytes, timestamp_ms, &known)
+            .await
     }
 
     /// Encrypt + dispatch via the sealed-sender path. Returns the
@@ -189,16 +253,15 @@ impl Client {
     async fn send_sealed_to_aci(
         &self,
         target: Aci,
-        body: &str,
-        attachments: &[proto::AttachmentPointer],
+        content_bytes: &[u8],
+        timestamp_ms: u64,
         access_key: [u8; zkgroup::ACCESS_KEY_LEN],
-    ) -> Result<u64, SendError> {
+    ) -> Result<(), SendError> {
         let target_string = target.service_id_string();
-        let timestamp_ms = now_millis();
         debug!(
-            "send_sealed_to_aci: target={} body_len={} timestamp_ms={}",
+            "send_sealed_to_aci: target={} content_len={} timestamp_ms={}",
             target_string,
-            body.len(),
+            content_bytes.len(),
             timestamp_ms
         );
 
@@ -239,8 +302,7 @@ impl Client {
             .encrypt_and_dispatch_sealed(
                 &target,
                 &target_string,
-                body,
-                attachments,
+                content_bytes,
                 timestamp_ms,
                 &cert,
                 access_key,
@@ -253,7 +315,7 @@ impl Client {
                     "send_sealed_to_aci: dispatched to {} timestamp_ms={}",
                     target_string, timestamp_ms
                 );
-                Ok(timestamp_ms)
+                Ok(())
             }
             SendAttempt::Mismatched(err) => {
                 warn!(
@@ -268,8 +330,7 @@ impl Client {
                     .encrypt_and_dispatch_sealed(
                         &target,
                         &target_string,
-                        body,
-                        attachments,
+                        content_bytes,
                         timestamp_ms,
                         &cert,
                         access_key,
@@ -282,7 +343,7 @@ impl Client {
                             "send_sealed_to_aci: dispatched (after retry) to {} timestamp_ms={}",
                             target_string, timestamp_ms
                         );
-                        Ok(timestamp_ms)
+                        Ok(())
                     }
                     SendAttempt::Mismatched(err2) => Err(SendError::Server(format!(
                         "mismatched devices on retry for {target_string}: \
@@ -448,8 +509,7 @@ impl Client {
         &self,
         target: &Aci,
         target_string: &str,
-        body: &str,
-        attachments: &[proto::AttachmentPointer],
+        content_bytes: &[u8],
         timestamp_ms: u64,
         cert: &libsignal_protocol::SenderCertificate,
         access_key: [u8; zkgroup::ACCESS_KEY_LEN],
@@ -463,13 +523,12 @@ impl Client {
         use libsignal_protocol::ServiceId;
 
         debug!(
-            "encrypt_and_dispatch_sealed: target={} devices={} timestamp_ms={}",
+            "encrypt_and_dispatch_sealed: target={} devices={} content_len={} timestamp_ms={}",
             target_string,
             targets.len(),
+            content_bytes.len(),
             timestamp_ms
         );
-
-        let content_bytes = build_one_to_one_content(body, timestamp_ms, attachments);
 
         // Encrypt inside one transaction so the ratchet advances for
         // every device atomically.
@@ -485,7 +544,7 @@ impl Client {
             let bytes = libsignal_protocol::sealed_sender_encrypt(
                 &remote_address,
                 cert,
-                &content_bytes,
+                content_bytes,
                 &mut session,
                 &mut identity,
                 std::time::SystemTime::now(),
@@ -586,21 +645,20 @@ impl Client {
     async fn send_unsealed_hotpath(
         &self,
         target: Aci,
-        body: &str,
-        attachments: &[proto::AttachmentPointer],
+        content_bytes: &[u8],
+        timestamp_ms: u64,
         known: &[u32],
-    ) -> Result<u64, SendError> {
+    ) -> Result<(), SendError> {
         use libsignal_net_chat::api::Auth;
         use libsignal_net_chat::api::messages::{AuthenticatedChatApi, SingleOutboundUnsealedMessage};
         use libsignal_protocol::ServiceId;
 
         let target_string = target.service_id_string();
-        let timestamp_ms = now_millis();
         debug!(
-            "send_unsealed_hotpath: target={} devices={} body_len={} timestamp_ms={}",
+            "send_unsealed_hotpath: target={} devices={} content_len={} timestamp_ms={}",
             target_string,
             known.len(),
-            body.len(),
+            content_bytes.len(),
             timestamp_ms
         );
 
@@ -620,7 +678,6 @@ impl Client {
         let mut session = tx_store.session_store();
         let mut identity = tx_store.identity_store(crate::crypto::prekeys::IdentityKind::Aci);
 
-        let content_bytes = build_one_to_one_content(body, timestamp_ms, attachments);
         let mut outbound: Vec<SingleOutboundUnsealedMessage<CiphertextMessage>> = Vec::with_capacity(known.len());
         for &device_id_u32 in known {
             let device_id =
@@ -631,7 +688,7 @@ impl Client {
                 .ok_or_else(|| SendError::Server(format!("session row for device {device_id} disappeared")))?;
             let registration_id = record.remote_registration_id().map_err(SendError::Signal)?;
             let ciphertext = libsignal_protocol::message_encrypt(
-                &content_bytes,
+                content_bytes,
                 &remote_address,
                 &local_address,
                 &mut session,
@@ -666,7 +723,7 @@ impl Client {
         .await
         .map_err(|e| SendError::Server(format!("send_message: {e:?}")))?;
 
-        Ok(timestamp_ms)
+        Ok(())
     }
 
     /// Encrypt a Note-to-Self transcript to each of the user's OTHER
@@ -906,6 +963,60 @@ pub(crate) fn build_one_to_one_content(
         body: Some(body.to_string()),
         timestamp: Some(timestamp),
         attachments: attachments.to_vec(),
+        ..Default::default()
+    };
+    let content = proto::Content {
+        content: Some(proto::content::Content::DataMessage(dm)),
+        ..Default::default()
+    };
+    content.encode_to_vec()
+}
+
+/// Build the inner Content protobuf for a typing indicator: wraps a
+/// `TypingMessage` (with `STARTED` or `STOPPED` action and the supplied
+/// timestamp) in the top-level Content. The `groupId` field is left
+/// unset; only 1:1 typing is supported by [`Client::typing`] in v1.
+pub(crate) fn build_typing_content(started: bool, timestamp: u64) -> Vec<u8> {
+    use prost::Message as _;
+
+    debug!("build_typing_content: started={} timestamp={}", started, timestamp);
+
+    let action = if started {
+        proto::typing_message::Action::Started
+    } else {
+        proto::typing_message::Action::Stopped
+    };
+    let tm = proto::TypingMessage {
+        timestamp: Some(timestamp),
+        action: Some(action as i32),
+        group_id: None,
+    };
+    let content = proto::Content {
+        content: Some(proto::content::Content::TypingMessage(tm)),
+        ..Default::default()
+    };
+    content.encode_to_vec()
+}
+
+/// Build the inner Content protobuf for a remote-delete request:
+/// wraps a `DataMessage` whose only meaningful field is
+/// `delete: Delete { target_sent_timestamp }`, plus the outer
+/// `timestamp` so the peer's client can correlate the delete
+/// envelope. No body, no attachments - the receiver replaces the
+/// targeted message in its UI with a tombstone.
+pub(crate) fn build_delete_content(target_sent_timestamp: u64, timestamp: u64) -> Vec<u8> {
+    use prost::Message as _;
+
+    debug!(
+        "build_delete_content: target_sent_timestamp={} timestamp={}",
+        target_sent_timestamp, timestamp
+    );
+
+    let dm = proto::DataMessage {
+        timestamp: Some(timestamp),
+        delete: Some(proto::data_message::Delete {
+            target_sent_timestamp: Some(target_sent_timestamp),
+        }),
         ..Default::default()
     };
     let content = proto::Content {
