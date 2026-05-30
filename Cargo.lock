@@ -4289,7 +4289,7 @@ dependencies = [
 
 [[package]]
 name = "signal-rs"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "aes 0.9.0",
  "async-trait",
