@@ -98,7 +98,7 @@ fn default_state_dir() -> PathBuf {
 }
 
 fn setup_logging(level: &str) -> Result<()> {
-    let log_dir = dirs::data_local_dir()
+    let log_dir = signal_rs::config::xdg_data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("signal-rs")
         .join("logs");

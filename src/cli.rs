@@ -32,7 +32,7 @@ static AFTER_HELP: LazyLock<String> = LazyLock::new(after_help_text);
 
 fn after_help_text() -> String {
     let state_dir = dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("signal-rs");
-    let log_path = dirs::data_local_dir()
+    let log_path = signal_rs::config::xdg_data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("signal-rs")
         .join("logs")
