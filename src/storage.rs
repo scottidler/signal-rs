@@ -115,6 +115,7 @@ pub enum StoreError {
 
 /// signal-rs's own identity-level API. The libsignal-protocol storage traits
 /// are implemented separately on `SqliteStore`.
+#[allow(clippy::double_must_use)] // async_trait emits #[must_use] on futures; clippy flags the expansion
 #[async_trait::async_trait(?Send)]
 pub trait Store {
     /// Persist a fresh identity record. Called once at link time.
