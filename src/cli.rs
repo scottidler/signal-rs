@@ -51,7 +51,7 @@ fn after_help_text() -> String {
     long_about = "Native-Rust Signal client. Link as a secondary device, receive Signal\n\
                   envelopes, and send a 1:1 text message. Note-to-Self is the primary\n\
                   use case for borg ingest.",
-    version = env!("GIT_DESCRIBE"),
+    version = env!("BUILD_VERSION"),
     after_help = AFTER_HELP.as_str(),
 )]
 pub struct Cli {

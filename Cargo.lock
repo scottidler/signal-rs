@@ -514,6 +514,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "build-version"
+version = "0.1.0"
+source = "git+https://github.com/tatari-tv/build-version-rs?tag=v0.1.0#06411938a54d50b035784b4bb6d9ffb9a187acc7"
+
+[[package]]
 name = "built"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4294,6 +4299,7 @@ dependencies = [
  "aes 0.9.0",
  "async-trait",
  "base64",
+ "build-version",
  "bytes",
  "cbc 0.2.1",
  "clap",
